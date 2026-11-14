@@ -30,6 +30,7 @@ import {
 } from "lucide-react";
 import { seed, grammar, makeQuestion, chooseItems, schedule } from "./learning";
 import "./style.css";
+import { analyzeInput } from "./services/languageServices";
 function read(key, fallback) {
   try {
     return JSON.parse(localStorage.getItem(key)) ?? fallback;
@@ -50,7 +51,12 @@ function useStored(key, initial) {
     },
   ];
 }
-const labels = { word: "کلمه", phrase: "اصطلاح", sentence: "جمله" };
+const labels = {
+  word: "کلمه",
+  phrase: "اصطلاح",
+  sentence: "جمله",
+  pending: "در انتظار تحلیل",
+};
 function App() {
   const [page, setPage] = useState("home");
   const [items, setItems] = useStored("parola.items.v1", seed);
@@ -62,6 +68,11 @@ function App() {
     base: "fa",
     target: "it",
   });
+  const [profile, setProfile] = useStored("parola.profile.v1", {
+    displayName: "",
+  });
+  const [onboarded, setOnboarded] = useStored("parola.onboarding.v1", false);
+  const displayName = profile.displayName.trim() || "زبان‌آموز";
   const [modal, setModal] = useState(false);
   const [filter, setFilter] = useState("all");
   const [search, setSearch] = useState("");
@@ -100,14 +111,17 @@ function App() {
     if (mode === "grammar")
       questions = grammar.map((g) => ({ ...g, prompt: g.text, grammar: true }));
     else {
+      const ready = items.filter(
+        (x) => x.kind !== "pending" && x.meaning.trim(),
+      );
       let pool =
         mode === "sentence"
-          ? items.filter((x) => x.kind === "sentence")
+          ? ready.filter((x) => x.kind === "sentence")
           : mode === "word"
-            ? items.filter((x) => x.kind !== "sentence")
-            : items;
+            ? ready.filter((x) => x.kind !== "sentence")
+            : ready;
       questions = chooseItems(pool, progress, Number(settings.daily))
-        .map((x) => makeQuestion(x, items, mode === "reverse"))
+        .map((x) => makeQuestion(x, ready, mode === "reverse"))
         .filter(Boolean);
     }
     if (!questions.length)
@@ -166,7 +180,8 @@ function App() {
               typeof x.text === "string" &&
               typeof x.meaning === "string" &&
               labels[x.kind] &&
-              ["A1", "A2", "B1", "B2", "C1", "C2"].includes(x.level),
+              (x.level === null ||
+                ["A1", "A2", "B1", "B2", "C1", "C2"].includes(x.level)),
           )
         )
           throw Error();
@@ -241,9 +256,10 @@ function App() {
             </p>
           </div>
           <div className="profile">
-            <div className="avatar">غ</div>
+            <div className="avatar">{displayName.slice(0, 1)}</div>
             <div>
-              غزل<small>زبان‌آموز کنجکاو</small>
+              {displayName}
+              <small>زبان‌آموز کنجکاو</small>
             </div>
             <MoreHorizontal size={20} />
           </div>
@@ -274,7 +290,8 @@ function App() {
                 <div>
                   <div className="eyebrow">UN PO’ OGNI GIORNO</div>
                   <h1>
-                    چاو غزل، آماده‌ای؟ <span className="wave">✳</span>
+                    چاو {displayName}، آماده‌ای؟{" "}
+                    <span className="wave">✳</span>
                   </h1>
                   <p>امروز هم یک قدم به ایتالیایی فکر کردن نزدیک‌تر شو.</p>
                 </div>
@@ -712,11 +729,25 @@ function App() {
               />
               <div className="settings-grid">
                 <section className="settings-card">
+                  <h3>پروفایل موقت</h3>
+                  <label>
+                    نام نمایشی
+                    <input
+                      placeholder="نام شما؛ بعداً از حساب کاربری"
+                      value={profile.displayName}
+                      onChange={(e) =>
+                        setProfile({ displayName: e.target.value })
+                      }
+                    />
+                  </label>
+                  <p>این فیلد موقت است و ورود یا ثبت‌نام انجام نمی‌دهد.</p>
+                </section>
+                <section className="settings-card">
                   <h3>
                     <GraduationCap size={20} /> برنامهٔ یادگیری
                   </h3>
                   <label>
-                    سطح ایتالیایی
+                    سطح تولید محتوای جدید
                     <select
                       value={settings.level}
                       onChange={(e) =>
@@ -745,8 +776,9 @@ function App() {
                     </select>
                   </label>
                   <p className="muted">
-                    زبان فعلی: فارسی ← ایتالیایی. زبان‌های دیگر در نسخه‌های بعدی
-                    اضافه می‌شوند.
+                    سطح انتخابی فقط برای تولید محتوای جدید است؛ ذخیره و مرور
+                    محتوا در هر سطحی آزاد است. زبان فعلی: فارسی ← ایتالیایی.
+                    زبان‌های دیگر در نسخه‌های بعدی اضافه می‌شوند.
                   </p>
                 </section>
                 <section className="settings-card">
@@ -796,6 +828,13 @@ function App() {
           )}
         </div>
       </main>
+      {!onboarded && (
+        <LevelSetup
+          level={settings.level}
+          change={(level) => setSettings((s) => ({ ...s, level }))}
+          finish={() => setOnboarded(true)}
+        />
+      )}
       {notice && (
         <div role="status" className="toast">
           {notice}
@@ -809,7 +848,6 @@ function App() {
             setModal(false);
             toast("به دفترچه اضافه شد.");
           }}
-          level={settings.level}
         />
       )}
     </div>
@@ -863,7 +901,7 @@ function ItemCard({ item, speak, remove }) {
       <div className="item-top">
         <span className="badge">{labels[item.kind]}</span>
         <div>
-          <span className="item-level">{item.level}</span>
+          <span className="item-level">{item.level || "—"}</span>
           {remove && (
             <button
               className="icon-button delete"
@@ -885,7 +923,7 @@ function ItemCard({ item, speak, remove }) {
           <Volume2 size={18} />
         </button>
       </div>
-      <p>{item.meaning}</p>
+      <p>{item.meaning || "معنی: در انتظار تحلیل مدل"}</p>
       {item.example && (
         <div className="item-example" dir="ltr">
           {item.example}
@@ -970,109 +1008,152 @@ function Quiz({ session, answer, submit, next, speak }) {
     </div>
   );
 }
-function AddModal({ close, save, level }) {
-  const [form, setForm] = useState({
-    text: "",
-    meaning: "",
-    kind: "word",
-    level,
-    example: "",
-    translation: "",
-    tag: "",
-  });
+function AddModal({ close, save }) {
+  const [text, setText] = useState("");
+  const [meaning, setMeaning] = useState("");
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  function field(key) {
-    return {
-      value: form[key],
-      onChange: (e) => setForm((f) => ({ ...f, [key]: e.target.value })),
-    };
+
+  async function handleSubmit(event) {
+    event.preventDefault();
+
+    if (loading || !text.trim()) return;
+
+    setLoading(true);
+    setError("");
+
+    try {
+      const analysis = await analyzeInput(text);
+
+      await save({
+        ...analysis,
+        text: text.trim(),
+        note: meaning.trim(),
+        tag: "",
+        analysisStatus: "completed",
+      });
+    } catch (error) {
+      setError(error.message || "تحلیل انجام نشد.");
+    } finally {
+      setLoading(false);
+    }
   }
+
+  function handleClose() {
+    if (!loading) close();
+  }
+
   return (
-    <div className="modal-backdrop" onClick={close}>
+    <div className="modal-backdrop" onClick={handleClose}>
       <section
+        className="modal"
         role="dialog"
         aria-modal="true"
         aria-labelledby="add-title"
-        className="modal"
-        onClick={(e) => e.stopPropagation()}
+        aria-busy={loading}
+        onClick={(event) => event.stopPropagation()}
       >
         <div className="section-title">
-          <h2 id="add-title">یک چیز تازه به دفترچه</h2>
-          <button className="icon-button" aria-label="بستن" onClick={close}>
+          <h2 id="add-title">فقط بنویس، ذخیره کن</h2>
+
+          <button
+            className="icon-button"
+            onClick={handleClose}
+            aria-label="بستن"
+            disabled={loading}
+          >
             <X />
           </button>
         </div>
-        <p className="muted">کلمه، اصطلاح یا جمله‌ای که می‌خوای یادت بمونه.</p>
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (!form.text.trim() || !form.meaning.trim())
-              return setError("متن و معنی را وارد کن.");
-            save(
-              Object.fromEntries(
-                Object.entries(form).map(([k, v]) => [k, v.trim()]),
-              ),
-            );
-          }}
-        >
-          <div className="form-row">
-            <label>
-              نوع محتوا
-              <select {...field("kind")}>
-                {Object.entries(labels).map(([v, t]) => (
-                  <option value={v} key={v}>
-                    {t}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              سطح
-              <select {...field("level")}>
-                {["A1", "A2", "B1", "B2", "C1", "C2"].map((x) => (
-                  <option key={x}>{x}</option>
-                ))}
-              </select>
-            </label>
-          </div>
+
+        <p className="muted">
+          نوع، معنی، سطح و مثال را مدل پیشنهاد می‌دهد.
+        </p>
+
+        <form onSubmit={handleSubmit}>
           <label>
             متن ایتالیایی
             <input
               autoFocus
               required
+              maxLength={2000}
               dir="ltr"
-              placeholder="مثلاً: Avere bisogno di"
-              {...field("text")}
+              value={text}
+              disabled={loading}
+              onChange={(event) => setText(event.target.value)}
+              placeholder="هر چیزی که می‌خواهی یاد بگیری…"
             />
           </label>
-          <label>
-            معنی فارسی
-            <input required placeholder="نیاز داشتن به" {...field("meaning")} />
-          </label>
-          <label>
-            جملهٔ نمونه (اختیاری)
-            <input
-              dir="ltr"
-              placeholder="Ho bisogno di riposarmi."
-              {...field("example")}
-            />
-          </label>
-          <label>
-            ترجمهٔ مثال (اختیاری)
-            <input {...field("translation")} />
-          </label>
-          <label>
-            موضوع (اختیاری)
-            <input
-              placeholder="زندگی روزمره، دانشگاه، سفر…"
-              {...field("tag")}
-            />
-          </label>
-          {error && <p role="alert">{error}</p>}
-          <button className="button primary full" type="submit">
-            <Plus size={18} /> افزودن به دفترچه
+
+          <details>
+            <summary>یادداشت شخصی (اختیاری)</summary>
+
+            <label>
+              یادداشت تو
+              <input
+                value={meaning}
+                disabled={loading}
+                onChange={(event) => setMeaning(event.target.value)}
+              />
+            </label>
+          </details>
+
+          <p className="muted">
+            متن برای تحلیل به Gemini ارسال می‌شود.
+            سطح یادگیری تو، ذخیرهٔ این مورد را محدود نمی‌کند.
+          </p>
+
+          {error && (
+            <p role="alert" style={{ color: "#a34432" }}>
+              {error}
+            </p>
+          )}
+
+          {loading && (
+            <p role="status">
+              در حال تشخیص معنی و ساختن مثال…
+            </p>
+          )}
+
+          <button
+            className="button primary full"
+            type="submit"
+            disabled={loading || !text.trim()}
+          >
+            <Plus size={18} />
+            {loading ? "در حال تحلیل…" : "تحلیل و ذخیره"}
           </button>
         </form>
+      </section>
+    </div>
+  );
+}
+function LevelSetup({ level, change, finish }) {
+  return (
+    <div className="modal-backdrop">
+      <section
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="level-title"
+      >
+        <h2 id="level-title">از چه سطحی شروع کنیم؟</h2>
+        <p className="muted">
+          این سطح برای جمله‌ها، گرامر و کلمه‌هایی است که مدل تولید خواهد کرد. هر
+          عبارت سخت‌تری را هم می‌توانی ذخیره کنی.
+        </p>
+        <label>
+          سطح یادگیری
+          <select value={level} onChange={(e) => change(e.target.value)}>
+            {["A1", "A2", "B1", "B2", "C1", "C2"].map((x) => (
+              <option key={x}>{x}</option>
+            ))}
+          </select>
+        </label>
+        <p className="muted">هر وقت خواستی از تنظیمات تغییرش بده.</p>
+        <button className="button primary full" onClick={finish}>
+          شروع یادگیری
+        </button>
       </section>
     </div>
   );

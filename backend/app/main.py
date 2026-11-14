@@ -8,6 +8,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import create_engine, String, Integer, DateTime, ForeignKey, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, Session
 import secrets
+from app.ai import AnalysisError, analyze_content
+from app.schemas import ContentAnalysis
 
 class Settings(BaseSettings):
     database_url: str = 'postgresql+psycopg://parola:parola@db:5432/parola'
@@ -98,3 +100,26 @@ def review_item(item_id: str, attempt: Attempt, session: Session = Depends(db)):
     review.due=datetime.now(timezone.utc)+interval
     session.commit(); session.refresh(review)
     return {'streak':review.streak,'attempts':review.attempts,'correct':review.correct,'due':review.due}
+
+class AnalysisRequest(BaseModel):
+    model_config = {
+        "str_strip_whitespace": True,
+        "extra": "forbid",
+    }
+
+    text: str = Field(min_length=1, max_length=2000)
+
+
+@app.post(
+    "/api/analyze",
+    response_model=ContentAnalysis,
+    dependencies=[Depends(authorize)],
+)
+async def analyze_input(data: AnalysisRequest):
+    try:
+        return await analyze_content(data.text)
+    except AnalysisError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc),
+        ) from exc
