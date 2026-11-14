@@ -8,9 +8,9 @@ from sqlalchemy.pool import StaticPool
 from app.main import app, Base, db
 engine=create_engine('sqlite://',connect_args={'check_same_thread':False},poolclass=StaticPool)
 Base.metadata.create_all(engine)
-def test_db():
+def override_db():
     with Session(engine) as session: yield session
-app.dependency_overrides[db]=test_db
+app.dependency_overrides[db]=override_db
 client=TestClient(app)
 headers={'Authorization':'Bearer test-only-token'}
 
