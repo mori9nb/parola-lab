@@ -1,7 +1,13 @@
 import { defineConfig, loadEnv } from "vite";
 import { fileURLToPath } from "node:url";
 
-export default defineConfig(({ mode }) => {
+export default defineConfig(({ mode, command }) => {
+  // ساخت خروجی بدون نیاز به توکن یا فایل .env
+  if (command === "build") {
+    return {};
+  }
+
+  // تنظیم اتصال به بک‌اند فقط هنگام توسعه
   const backendDirectory = fileURLToPath(
     new URL("./backend/", import.meta.url),
   );
