@@ -1,0 +1,100 @@
+"""Single-owner development API. Public multi-user auth is a later milestone."""
+from datetime import datetime, timezone, timedelta
+from typing import Literal
+from uuid import uuid4
+from fastapi import FastAPI, Depends, HTTPException, Header
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy import create_engine, String, Integer, DateTime, ForeignKey, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, Session
+import secrets
+
+class Settings(BaseSettings):
+    database_url: str = 'postgresql+psycopg://parola:parola@db:5432/parola'
+    api_token: str = ''
+    model_config = SettingsConfigDict(env_file='.env', extra='ignore')
+settings = Settings()
+engine = create_engine(settings.database_url, pool_pre_ping=True)
+SessionLocal = sessionmaker(engine)
+class Base(DeclarativeBase): pass
+class Item(Base):
+    __tablename__ = 'items'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    text: Mapped[str] = mapped_column(String(2000))
+    meaning: Mapped[str] = mapped_column(String(2000))
+    kind: Mapped[str] = mapped_column(String(16))
+    level: Mapped[str] = mapped_column(String(2))
+    source_language: Mapped[str] = mapped_column(String(35), default='fa')
+    target_language: Mapped[str] = mapped_column(String(35), default='it')
+    example: Mapped[str] = mapped_column(String(3000), default='')
+    translation: Mapped[str] = mapped_column(String(3000), default='')
+    tag: Mapped[str] = mapped_column(String(100), default='')
+class Review(Base):
+    __tablename__ = 'reviews'
+    item_id: Mapped[str] = mapped_column(ForeignKey('items.id', ondelete='CASCADE'), primary_key=True)
+    streak: Mapped[int] = mapped_column(Integer, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    correct: Mapped[int] = mapped_column(Integer, default=0)
+    due: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+class ItemIn(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+    meaning: str = Field(min_length=1, max_length=2000)
+    kind: Literal['word','phrase','sentence'] = 'word'
+    level: Literal['A1','A2','B1','B2','C1','C2'] = 'A2'
+    source_language: str = Field(default='fa', min_length=2, max_length=35)
+    target_language: str = Field(default='it', min_length=2, max_length=35)
+    example: str = Field(default='', max_length=3000)
+    translation: str = Field(default='', max_length=3000)
+    tag: str = Field(default='', max_length=100)
+class ItemOut(ItemIn):
+    id: str
+    model_config = {'from_attributes': True}
+class Attempt(BaseModel):
+    correct: bool
+
+def db():
+    with SessionLocal() as session: yield session
+
+def authorize(authorization: str = Header(default='')):
+    if not settings.api_token:
+        raise HTTPException(503, 'Set API_TOKEN before enabling the API')
+    if not secrets.compare_digest(authorization, f'Bearer {settings.api_token}'):
+        raise HTTPException(401, 'Invalid bearer token')
+
+app = FastAPI(title='Parola Lab API', version='0.1.0')
+@app.get('/health')
+def health(): return {'status':'ok','version':'0.1.0'}
+@app.get('/api/capabilities', dependencies=[Depends(authorize)])
+def capabilities(): return {'storage':'postgresql','ai':False,'speech':False,'push':False,'mode':'single-owner-development'}
+@app.get('/api/items', response_model=list[ItemOut], dependencies=[Depends(authorize)])
+def list_items(session: Session = Depends(db)):
+    return session.scalars(select(Item).order_by(Item.id)).all()
+@app.post('/api/items', response_model=ItemOut, status_code=201, dependencies=[Depends(authorize)])
+def add_item(data: ItemIn, session: Session = Depends(db)):
+    if not data.text.strip() or not data.meaning.strip(): raise HTTPException(422,'Text and meaning cannot be blank')
+    item = Item(id=str(uuid4()), **data.model_dump())
+    session.add(item); session.commit(); session.refresh(item)
+    return item
+@app.delete('/api/items/{item_id}', status_code=204, dependencies=[Depends(authorize)])
+def delete_item(item_id: str, session: Session = Depends(db)):
+    item = session.get(Item,item_id)
+    if not item: raise HTTPException(404,'Item not found')
+    review=session.get(Review,item_id)
+    if review: session.delete(review); session.flush()
+    session.delete(item); session.commit()
+@app.post('/api/items/{item_id}/review', dependencies=[Depends(authorize)])
+def review_item(item_id: str, attempt: Attempt, session: Session = Depends(db)):
+    # Lock the parent so concurrent attempts cannot overwrite review counters.
+    item=session.scalar(select(Item).where(Item.id==item_id).with_for_update())
+    if not item: raise HTTPException(404,'Item not found')
+    review=session.get(Review,item_id)
+    if review is None:
+        review=Review(item_id=item_id,streak=0,attempts=0,correct=0)
+        session.add(review)
+    review.attempts+=1
+    review.correct+=int(attempt.correct)
+    review.streak=review.streak+1 if attempt.correct else 0
+    interval=timedelta(days=min(30,2**min(review.streak-1,5))) if attempt.correct else timedelta(minutes=10)
+    review.due=datetime.now(timezone.utc)+interval
+    session.commit(); session.refresh(review)
+    return {'streak':review.streak,'attempts':review.attempts,'correct':review.correct,'due':review.due}
