@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useRef } from "react";
 import { createRoot } from "react-dom/client";
 import {
   BookOpen,
@@ -28,9 +28,13 @@ import {
   Globe,
   MoreHorizontal,
 } from "lucide-react";
-import { seed, grammar, makeQuestion, chooseItems, schedule } from "./learning";
+import { seed, grammar, makeQuestion, chooseItems, schedule,shuffle } from "./learning";
 import "./style.css";
-import { analyzeInput } from "./services/languageServices";
+import {
+  analyzeInput,
+  generateContent,
+  generateGrammar,
+} from "./services/languageServices";
 function read(key, fallback) {
   try {
     return JSON.parse(localStorage.getItem(key)) ?? fallback;
@@ -71,6 +75,13 @@ function App() {
   const [profile, setProfile] = useStored("parola.profile.v1", {
     displayName: "",
   });
+  const [grammarBank, setGrammarBank] = useStored(
+  "parola.grammarBank.v1",
+  grammar.map((question) => ({
+    ...question,
+    origin: "starter",
+  })),
+);
   const [onboarded, setOnboarded] = useStored("parola.onboarding.v1", false);
   const displayName = profile.displayName.trim() || "زبان‌آموز";
   const [modal, setModal] = useState(false);
@@ -88,6 +99,13 @@ function App() {
   const due = items.filter(
     (x) => !progress[x.id] || progress[x.id].due <= Date.now(),
   ).length;
+  const [preparing, setPreparing] = useState(false);
+  const preparingLock = useRef(false);
+
+  const [generationDays, setGenerationDays] = useStored(
+    "parola.generationDays.v1",
+    {},
+  );
   const accuracy = history.length
     ? Math.round(
         (history.filter((x) => x.correct).length / history.length) * 100,
@@ -106,29 +124,346 @@ function App() {
     u.rate = 0.85;
     speechSynthesis.speak(u);
   }
-  function start(mode = "mix") {
-    let questions;
-    if (mode === "grammar")
-      questions = grammar.map((g) => ({ ...g, prompt: g.text, grammar: true }));
-    else {
-      const ready = items.filter(
-        (x) => x.kind !== "pending" && x.meaning.trim(),
-      );
-      let pool =
-        mode === "sentence"
-          ? ready.filter((x) => x.kind === "sentence")
-          : mode === "word"
-            ? ready.filter((x) => x.kind !== "sentence")
-            : ready;
-      questions = chooseItems(pool, progress, Number(settings.daily))
-        .map((x) => makeQuestion(x, ready, mode === "reverse"))
-        .filter(Boolean);
+  async function prepareGrammarSession() {
+  const level = settings.level;
+  const limit = Number(settings.daily);
+  const freshLimit = Math.min(3, Math.floor(limit / 3));
+
+  const now = new Date();
+  const dayKey = [
+    now.getFullYear(),
+    now.getMonth() + 1,
+    now.getDate(),
+  ].join("-");
+
+  const generationKey = `grammar:${level}`;
+
+  const normalize = (text) =>
+    text.trim().toLocaleLowerCase("it");
+
+  let bank = [...grammarBank];
+
+  const unused = bank.filter(
+    (question) =>
+      question.origin === "ai" &&
+      question.level === level &&
+      !progress[question.id]?.attempts,
+  );
+
+  const needsGeneration =
+    unused.length < freshLimit &&
+    generationDays[generationKey] !== dayKey;
+
+  if (needsGeneration) {
+    const personalItems = items.filter(
+      (item) =>
+        item.kind !== "pending" &&
+        item.origin !== "ai" &&
+        item.text?.trim() &&
+        item.meaning?.trim(),
+    );
+
+    const seeds = [
+      ...new Set(
+        chooseItems(personalItems, progress, 10).map(
+          (item) => item.text.trim(),
+        ),
+      ),
+    ];
+
+    if (seeds.length) {
+      try {
+        const generated = await generateGrammar(seeds, level);
+
+        const seen = new Set(
+          bank.map((question) => normalize(question.text)),
+        );
+
+        const additions = generated
+          .filter((question) => {
+            const key = normalize(question.text);
+
+            if (seen.has(key)) return false;
+
+            seen.add(key);
+            return true;
+          })
+          .map((question) => ({
+            ...question,
+            id: crypto.randomUUID(),
+            origin: "ai",
+            createdAt: new Date().toISOString(),
+          }));
+
+        if (additions.length) {
+          setGrammarBank((current) => {
+            const existing = new Set(
+              current.map((question) =>
+                normalize(question.text),
+              ),
+            );
+
+            return [
+              ...current,
+              ...additions.filter(
+                (question) =>
+                  !existing.has(normalize(question.text)),
+              ),
+            ];
+          });
+
+          bank = [...bank, ...additions];
+        }
+
+        setGenerationDays((current) => ({
+          ...current,
+          [generationKey]: dayKey,
+        }));
+      } catch {
+        toast(
+          "گرامر تازه آماده نشد؛ از سؤال‌های ذخیره‌شده استفاده می‌کنیم.",
+        );
+      }
     }
-    if (!questions.length)
-      return toast("برای ساخت سؤال حداقل ۴ مورد با معنی‌های متفاوت وارد کن.");
-    setSession({ questions, index: 0, score: 0, mode });
-    setAnswer(null);
-    setPage("practice");
+  }
+
+  const eligible = bank.filter(
+    (question) =>
+      question.origin === "starter" ||
+      question.level === level ||
+      progress[question.id]?.attempts > 0,
+  );
+
+  const fresh = chooseItems(
+    eligible.filter(
+      (question) =>
+        question.origin === "ai" &&
+        question.level === level &&
+        !progress[question.id]?.attempts,
+    ),
+    progress,
+    freshLimit,
+  );
+
+  const freshIds = new Set(
+    fresh.map((question) => question.id),
+  );
+
+  const review = chooseItems(
+    eligible.filter(
+      (question) => !freshIds.has(question.id),
+    ),
+    progress,
+    limit - fresh.length,
+  );
+
+  return [...fresh, ...review].map((question) => ({
+    ...question,
+    prompt: question.text,
+    grammar: true,
+    options: shuffle(question.options),
+  }));
+}
+  async function start(mode = "mix") {
+    if (preparingLock.current) return;
+
+    preparingLock.current = true;
+    setPreparing(true);
+
+    try {
+      // گرامر فعلاً از مجموعهٔ فعلی استفاده می‌کند.
+      if (mode === "grammar") {
+        const questions = await prepareGrammarSession();
+
+        if (!questions.length) {
+          toast("هنوز تمرین گرامری موجود نیست.");
+          return;
+        }
+
+        setSession({
+          questions,
+          index: 0,
+          score: 0,
+          mode,
+        });
+        setAnswer(null);
+        setPage("practice");
+        return;
+      }
+
+      const level = settings.level;
+      const limit = Number(settings.daily);
+      const freshLimit = Math.min(3, Math.floor(limit / 3));
+
+      const now = new Date();
+      const dayKey = [
+        now.getFullYear(),
+        now.getMonth() + 1,
+        now.getDate(),
+      ].join("-");
+
+      const normalize = (text) =>
+        text.trim().toLocaleLowerCase("it");
+
+      const isReady = (item) =>
+        item.kind !== "pending" &&
+        typeof item.meaning === "string" &&
+        item.meaning.trim().length > 0;
+
+      const matchesMode = (item) =>
+        mode === "sentence"
+          ? item.kind === "sentence"
+          : mode === "word"
+            ? item.kind !== "sentence"
+            : true;
+
+      let ready = items.filter(isReady);
+
+      const unusedGenerated = ready.filter(
+        (item) =>
+          item.origin === "ai" &&
+          item.level === level &&
+          !progress[item.id]?.attempts &&
+          matchesMode(item),
+      );
+
+      const needsGeneration =
+        unusedGenerated.length < freshLimit &&
+        generationDays[level] !== dayKey;
+
+      if (needsGeneration) {
+        // تنوع مبنا: ورودی‌های کمتر تمرین‌شده اولویت دارند.
+        const personalItems = ready.filter(
+          (item) => item.origin !== "ai",
+        );
+
+        const candidateSeeds = chooseItems(
+          personalItems,
+          progress,
+          10,
+        );
+
+        const seeds = [
+          ...new Set(candidateSeeds.map((item) => item.text.trim())),
+        ];
+
+        if (seeds.length) {
+          try {
+            const generated = await generateContent(seeds, level);
+
+            const seen = new Set(
+              items.map((item) => normalize(item.text)),
+            );
+
+            const additions = generated
+              .filter((item) => {
+                const key = normalize(item.text);
+
+                if (seen.has(key)) return false;
+
+                seen.add(key);
+                return true;
+              })
+              .map((item) => ({
+                ...item,
+                id: crypto.randomUUID(),
+                origin: "ai",
+                analysisStatus: "completed",
+                tag: "پیشنهاد مدل",
+                createdAt: new Date().toISOString(),
+              }));
+
+            if (additions.length) {
+              setItems((current) => {
+                const existing = new Set(
+                  current.map((item) => normalize(item.text)),
+                );
+
+                return [
+                  ...current,
+                  ...additions.filter(
+                    (item) => !existing.has(normalize(item.text)),
+                  ),
+                ];
+              });
+
+              // از نتیجهٔ همین درخواست استفاده می‌کنیم؛
+              // منتظر به‌روزرسانی state نمی‌مانیم.
+              ready = [...ready, ...additions];
+            }
+
+            setGenerationDays((current) => ({
+              ...current,
+              [level]: dayKey,
+            }));
+          } catch {
+            toast(
+              "محتوای تازه آماده نشد؛ تمرین با مطالب موجود ادامه دارد.",
+            );
+          }
+        }
+      }
+
+      const pool = ready.filter(matchesMode);
+      const reverse = mode === "reverse";
+
+      // اول سؤال‌های قابل‌ساخت را مشخص می‌کنیم.
+      const questionsById = new Map();
+
+      for (const item of pool) {
+        const question = makeQuestion(item, ready, reverse);
+
+        if (question) {
+          questionsById.set(item.id, question);
+        }
+      }
+
+      const eligible = pool.filter((item) =>
+        questionsById.has(item.id),
+      );
+
+      const fresh = chooseItems(
+        eligible.filter(
+          (item) =>
+            item.origin === "ai" &&
+            item.level === level &&
+            !progress[item.id]?.attempts,
+        ),
+        progress,
+        freshLimit,
+      );
+
+      const freshIds = new Set(fresh.map((item) => item.id));
+
+      const review = chooseItems(
+        eligible.filter((item) => !freshIds.has(item.id)),
+        progress,
+        limit - fresh.length,
+      );
+
+      const questions = [...fresh, ...review].map((item) =>
+        questionsById.get(item.id),
+      );
+
+      if (!questions.length) {
+        toast(
+          "هنوز محتوای کافی برای ساخت سؤال چهارگزینه‌ای نداریم.",
+        );
+        return;
+      }
+
+      setSession({
+        questions,
+        index: 0,
+        score: 0,
+        mode,
+      });
+      setAnswer(null);
+      setPage("practice");
+    } finally {
+      preparingLock.current = false;
+      setPreparing(false);
+    }
   }
   function submit(value) {
     if (answer !== null) return;
@@ -834,6 +1169,21 @@ function App() {
           change={(level) => setSettings((s) => ({ ...s, level }))}
           finish={() => setOnboarded(true)}
         />
+      )}
+      {preparing && (
+        <div
+          className="modal-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="preparing-title"
+        >
+          <section className="modal">
+            <h2 id="preparing-title">داریم تمرینت رو آماده می‌کنیم</h2>
+            <p role="status">
+             مرور دفترچه و آماده‌کردن مطالب تازه…
+            </p>
+          </section>
+        </div>
       )}
       {notice && (
         <div role="status" className="toast">

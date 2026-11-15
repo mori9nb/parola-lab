@@ -12,12 +12,14 @@ from app.ai import (
     AnalysisError,
     analyze_content,
     generate_content,
+    generate_grammar,
 )
 
 from app.schemas import (
     ContentAnalysis,
     GenerationRequest,
     GenerationResult,
+    GrammarResult,
 )
 
 class Settings(BaseSettings):
@@ -141,6 +143,21 @@ async def analyze_input(data: AnalysisRequest):
 async def generate_learning_content(data: GenerationRequest):
     try:
         return await generate_content(data)
+    except AnalysisError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc),
+        ) from exc
+
+
+@app.post(
+    "/api/grammar/generate",
+    response_model=GrammarResult,
+    dependencies=[Depends(authorize)],
+)
+async def generate_grammar_exercises(data: GenerationRequest):
+    try:
+        return await generate_grammar(data)
     except AnalysisError as exc:
         raise HTTPException(
             status_code=502,
