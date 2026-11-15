@@ -8,8 +8,17 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import create_engine, String, Integer, DateTime, ForeignKey, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, Session
 import secrets
-from app.ai import AnalysisError, analyze_content
-from app.schemas import ContentAnalysis
+from app.ai import (
+    AnalysisError,
+    analyze_content,
+    generate_content,
+)
+
+from app.schemas import (
+    ContentAnalysis,
+    GenerationRequest,
+    GenerationResult,
+)
 
 class Settings(BaseSettings):
     database_url: str = 'postgresql+psycopg://parola:parola@db:5432/parola'
@@ -118,6 +127,20 @@ class AnalysisRequest(BaseModel):
 async def analyze_input(data: AnalysisRequest):
     try:
         return await analyze_content(data.text)
+    except AnalysisError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc),
+        ) from exc
+
+@app.post(
+    "/api/generate",
+    response_model=GenerationResult,
+    dependencies=[Depends(authorize)],
+)
+async def generate_learning_content(data: GenerationRequest):
+    try:
+        return await generate_content(data)
     except AnalysisError as exc:
         raise HTTPException(
             status_code=502,
