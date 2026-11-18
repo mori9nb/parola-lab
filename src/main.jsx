@@ -35,6 +35,7 @@ import {
   generateContent,
   generateGrammar,
 } from "./services/languageServices";
+import { importNotebook } from "./services/notebookServices";
 function read(key, fallback) {
   try {
     return JSON.parse(localStorage.getItem(key)) ?? fallback;
@@ -95,6 +96,8 @@ function App() {
   const today = new Date().toLocaleDateString("en-CA");
   const todayHistory = history.filter((x) => x.date === today);
   const practiced = new Set(history.map((x) => x.date)).size;
+  const [transferring, setTransferring] = useState(false);
+  const transferLock = useRef(false);
   const mastered = Object.values(progress).filter((x) => x.streak >= 3).length;
   const due = items.filter(
     (x) => !progress[x.id] || progress[x.id].due <= Date.now(),
@@ -481,12 +484,42 @@ function App() {
     setSession((s) => ({ ...s, index: s.index + 1 }));
     setAnswer(null);
   }
+  async function transferNotebook() {
+  if (transferLock.current) return;
+
+  transferLock.current = true;
+  setTransferring(true);
+
+  try {
+    const result = await importNotebook(items, progress);
+
+    toast(
+      `${result.created} مورد جدید، ` +
+      `${result.existing} مورد از قبل موجود و ` +
+      `${result.reviews_created} سابقهٔ مرور ذخیره شد.`,
+    );
+  } catch (error) {
+    toast(error.message || "انتقال انجام نشد.");
+  } finally {
+    transferLock.current = false;
+    setTransferring(false);
+  }
+}
   function exportData() {
     const url = URL.createObjectURL(
       new Blob(
         [
           JSON.stringify(
-            { version: 1, items, progress, history, settings },
+            {
+  version: 2,
+  items,
+  grammarBank,
+  progress,
+  history,
+  settings,
+  profile,
+  generationDays,
+},
             null,
             2,
           ),
@@ -521,6 +554,9 @@ function App() {
         )
           throw Error();
         setItems(d.items);
+        if (Array.isArray(d.grammarBank)) {
+          setGrammarBank(d.grammarBank);
+        }
         setProgress(d.progress || {});
         setHistory(Array.isArray(d.history) ? d.history : []);
         toast("دفترچه با موفقیت بازیابی شد.");
@@ -1127,6 +1163,22 @@ function App() {
                   <button className="button outline" onClick={exportData}>
                     <Download size={17} /> دریافت پشتیبان
                   </button>
+                  <button
+                      className="button outline"
+                      onClick={transferNotebook}
+                      disabled={transferring || preparing || Boolean(session)}
+                  >
+                    <Upload size={17} />
+                    {transferring
+                      ? "در حال انتقال…"
+                      : "کپی دفترچه به سرور"}
+                  </button>
+
+                  <p className="muted">
+                    کپی شامل دفترچه و پیشرفت مرور آن است.
+                    انتقال دوباره، داده‌های موجود سرور را بازنویسی نمی‌کند.
+                    گرامر و تاریخچه فعلاً محلی باقی می‌مانند.
+                  </p>
                   <label className="button outline import-button">
                     <Upload size={17} /> ورود پشتیبان
                     <input

@@ -5,9 +5,10 @@ from uuid import uuid4
 from fastapi import FastAPI, Depends, HTTPException, Header
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import create_engine, String, Integer, DateTime, ForeignKey, select
+from sqlalchemy import UniqueConstraint, func,create_engine, String, Integer, DateTime, ForeignKey, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, Session
 import secrets
+from app.notebook_schemas import NotebookImportIn
 from app.ai import (
     AnalysisError,
     analyze_content,
@@ -56,22 +57,90 @@ class User(Base):
         default=lambda: datetime.now(timezone.utc),
     )
 class Item(Base):
-    __tablename__ = 'items'
-    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    __tablename__ = "items"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "client_id",
+            name="uq_items_user_client",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+    )
+
     user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
+
+    client_id: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+    )
+
     text: Mapped[str] = mapped_column(String(2000))
     meaning: Mapped[str] = mapped_column(String(2000))
     kind: Mapped[str] = mapped_column(String(16))
-    level: Mapped[str] = mapped_column(String(2))
-    source_language: Mapped[str] = mapped_column(String(35), default='fa')
-    target_language: Mapped[str] = mapped_column(String(35), default='it')
-    example: Mapped[str] = mapped_column(String(3000), default='')
-    translation: Mapped[str] = mapped_column(String(3000), default='')
-    tag: Mapped[str] = mapped_column(String(100), default='')
+
+    level: Mapped[str | None] = mapped_column(
+        String(2),
+        nullable=True,
+    )
+
+    source_language: Mapped[str] = mapped_column(
+        String(35),
+        default="fa",
+    )
+
+    target_language: Mapped[str] = mapped_column(
+        String(35),
+        default="it",
+    )
+
+    example: Mapped[str] = mapped_column(
+        String(3000),
+        default="",
+    )
+
+    translation: Mapped[str] = mapped_column(
+        String(3000),
+        default="",
+    )
+
+    tag: Mapped[str] = mapped_column(
+        String(100),
+        default="",
+    )
+
+    note: Mapped[str] = mapped_column(
+        String(3000),
+        default="",
+    )
+
+    origin: Mapped[str] = mapped_column(
+        String(16),
+        default="user",
+    )
+
+    source_text: Mapped[str] = mapped_column(
+        String(2000),
+        default="",
+    )
+
+    analysis_status: Mapped[str] = mapped_column(
+        String(20),
+        default="completed",
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
 class Review(Base):
     __tablename__ = 'reviews'
     item_id: Mapped[str] = mapped_column(ForeignKey('items.id', ondelete='CASCADE'), primary_key=True)
@@ -111,6 +180,155 @@ def get_current_user_id(
     return DEV_USER_ID
 
 app = FastAPI(title='Parola Lab API', version='0.1.0')
+@app.post(
+    "/api/notebook/import",
+    dependencies=[Depends(authorize)],
+)
+def import_notebook(
+    data: NotebookImportIn,
+    session: Session = Depends(db),
+    user_id: str = Depends(get_current_user_id),
+):
+    created = 0
+    existing = 0
+    reviews_created = 0
+    mappings = []
+
+    try:
+        # درخواست‌های انتقال یک کاربر هم‌زمان اجرا نشوند.
+        user = session.scalar(
+            select(User)
+            .where(User.id == user_id)
+            .with_for_update()
+        )
+
+        if user is None:
+            raise HTTPException(404, "User not found")
+
+        for incoming in sorted(
+            data.items,
+            key=lambda value: value.client_id,
+        ):
+            item = session.scalar(
+                select(Item)
+                .where(
+                    Item.user_id == user_id,
+                    Item.client_id == incoming.client_id,
+                )
+                .with_for_update()
+            )
+
+            if item is None:
+                fields = incoming.model_dump(
+                    exclude={"review", "created_at"}
+                )
+
+                if incoming.created_at is not None:
+                    fields["created_at"] = incoming.created_at
+
+                item = Item(
+                    id=str(uuid4()),
+                    user_id=user_id,
+                    **fields,
+                )
+
+                session.add(item)
+                session.flush()
+                created += 1
+            else:
+                existing += 1
+
+            if incoming.review is not None:
+                review = session.get(Review, item.id)
+
+                # انتقال اولیه است؛ مرور موجود بازنویسی نمی‌شود.
+                if review is None:
+                    session.add(
+                        Review(
+                            item_id=item.id,
+                            **incoming.review.model_dump(),
+                        )
+                    )
+                    reviews_created += 1
+
+            mappings.append(
+                {
+                    "client_id": incoming.client_id,
+                    "id": item.id,
+                }
+            )
+
+        session.commit()
+
+    except Exception:
+        session.rollback()
+        raise
+
+    return {
+        "created": created,
+        "existing": existing,
+        "reviews_created": reviews_created,
+        "mappings": mappings,
+    }
+@app.get(
+    "/api/notebook",
+    dependencies=[Depends(authorize)],
+)
+def get_notebook(
+    session: Session = Depends(db),
+    user_id: str = Depends(get_current_user_id),
+):
+    rows = session.execute(
+        select(Item, Review)
+        .outerjoin(Review, Review.item_id == Item.id)
+        .where(Item.user_id == user_id)
+        .order_by(Item.id)
+    ).all()
+
+    fields = (
+        "id",
+        "client_id",
+        "text",
+        "meaning",
+        "kind",
+        "level",
+        "source_language",
+        "target_language",
+        "example",
+        "translation",
+        "tag",
+        "note",
+        "origin",
+        "source_text",
+        "analysis_status",
+        "created_at",
+    )
+
+    items = []
+
+    for item, review in rows:
+        record = {
+            field: getattr(item, field)
+            for field in fields
+        }
+
+        record["review"] = (
+            {
+                "streak": review.streak,
+                "attempts": review.attempts,
+                "correct": review.correct,
+                "due": review.due,
+            }
+            if review is not None
+            else None
+        )
+
+        items.append(record)
+
+    return {
+        "version": 1,
+        "items": items,
+    }
 @app.get('/health')
 def health(): return {'status':'ok','version':'0.1.0'}
 @app.get('/api/capabilities', dependencies=[Depends(authorize)])
