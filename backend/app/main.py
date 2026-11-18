@@ -30,9 +30,39 @@ settings = Settings()
 engine = create_engine(settings.database_url, pool_pre_ping=True)
 SessionLocal = sessionmaker(engine)
 class Base(DeclarativeBase): pass
+DEV_USER_ID = "00000000-0000-0000-0000-000000000001"
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+    )
+
+    display_name: Mapped[str] = mapped_column(
+        String(100),
+    )
+
+    email: Mapped[str | None] = mapped_column(
+        String(254),
+        unique=True,
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
 class Item(Base):
     __tablename__ = 'items'
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     text: Mapped[str] = mapped_column(String(2000))
     meaning: Mapped[str] = mapped_column(String(2000))
     kind: Mapped[str] = mapped_column(String(16))
@@ -73,6 +103,12 @@ def authorize(authorization: str = Header(default='')):
         raise HTTPException(503, 'Set API_TOKEN before enabling the API')
     if not secrets.compare_digest(authorization, f'Bearer {settings.api_token}'):
         raise HTTPException(401, 'Invalid bearer token')
+def get_current_user_id(
+    _authorized=Depends(authorize),
+) -> str:
+    # فقط برای توسعهٔ محلی.
+    # بعداً شناسه از نشست احراز هویت‌شده گرفته می‌شود.
+    return DEV_USER_ID
 
 app = FastAPI(title='Parola Lab API', version='0.1.0')
 @app.get('/health')
@@ -80,25 +116,59 @@ def health(): return {'status':'ok','version':'0.1.0'}
 @app.get('/api/capabilities', dependencies=[Depends(authorize)])
 def capabilities(): return {'storage':'postgresql','ai':False,'speech':False,'push':False,'mode':'single-owner-development'}
 @app.get('/api/items', response_model=list[ItemOut], dependencies=[Depends(authorize)])
-def list_items(session: Session = Depends(db)):
-    return session.scalars(select(Item).order_by(Item.id)).all()
+def list_items(
+    session: Session = Depends(db),
+    user_id: str = Depends(get_current_user_id),
+):
+    statement = (
+        select(Item)
+        .where(Item.user_id == user_id)
+        .order_by(Item.id)
+    )
+
+    return session.scalars(statement).all()
 @app.post('/api/items', response_model=ItemOut, status_code=201, dependencies=[Depends(authorize)])
-def add_item(data: ItemIn, session: Session = Depends(db)):
+def add_item(data: ItemIn, session: Session = Depends(db),user_id: str = Depends(get_current_user_id),):
     if not data.text.strip() or not data.meaning.strip(): raise HTTPException(422,'Text and meaning cannot be blank')
-    item = Item(id=str(uuid4()), **data.model_dump())
+    item = Item(
+        id=str(uuid4()),
+        user_id=user_id,
+        **data.model_dump(),
+    )
     session.add(item); session.commit(); session.refresh(item)
     return item
 @app.delete('/api/items/{item_id}', status_code=204, dependencies=[Depends(authorize)])
-def delete_item(item_id: str, session: Session = Depends(db)):
-    item = session.get(Item,item_id)
+def delete_item(
+    item_id: str,
+    session: Session = Depends(db),
+    user_id: str = Depends(get_current_user_id),
+):
+    item = session.scalar(
+        select(Item).where(
+            Item.id == item_id,
+            Item.user_id == user_id,
+        )
+    )
     if not item: raise HTTPException(404,'Item not found')
     review=session.get(Review,item_id)
     if review: session.delete(review); session.flush()
     session.delete(item); session.commit()
 @app.post('/api/items/{item_id}/review', dependencies=[Depends(authorize)])
-def review_item(item_id: str, attempt: Attempt, session: Session = Depends(db)):
+def review_item(
+    item_id: str,
+    attempt: Attempt,
+    session: Session = Depends(db),
+    user_id: str = Depends(get_current_user_id),
+):
     # Lock the parent so concurrent attempts cannot overwrite review counters.
-    item=session.scalar(select(Item).where(Item.id==item_id).with_for_update())
+    item = session.scalar(
+        select(Item)
+        .where(
+            Item.id == item_id,
+            Item.user_id == user_id,
+        )
+        .with_for_update()
+    )
     if not item: raise HTTPException(404,'Item not found')
     review=session.get(Review,item_id)
     if review is None:
