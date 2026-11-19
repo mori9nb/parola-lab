@@ -4,3 +4,8 @@ dist
 .env
 .venv
 **/__pycache__
+.env.*
+**/.env
+**/.env.*
+**/.venv
+**/.pytest_cache

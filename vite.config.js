@@ -1,37 +1,9 @@
-import { defineConfig, loadEnv } from "vite";
-import { fileURLToPath } from "node:url";
+import { defineConfig } from "vite";
 
-export default defineConfig(({ mode, command }) => {
-  // ساخت خروجی بدون نیاز به توکن یا فایل .env
-  if (command === "build") {
-    return {};
-  }
-
-  // تنظیم اتصال به بک‌اند فقط هنگام توسعه
-  const backendDirectory = fileURLToPath(
-    new URL("./backend/", import.meta.url),
-  );
-
-  const { API_TOKEN } = loadEnv(
-    mode,
-    backendDirectory,
-    "API_TOKEN",
-  );
-
-  if (!API_TOKEN) {
-    throw new Error("API_TOKEN در backend/.env تنظیم نشده است.");
-  }
-
-  return {
-    server: {
-      proxy: {
-        "/api": {
-          target: "http://127.0.0.1:8000",
-          headers: {
-            Authorization: `Bearer ${API_TOKEN}`,
-          },
-        },
-      },
-    },
-  };
+// Cookies are forwarded by the same-origin proxy; no shared API token is injected.
+export default defineConfig({
+  server: {
+    host: "0.0.0.0",
+    proxy: { "/api": { target: process.env.PAROLA_API_URL ?? "http://127.0.0.1:8000", changeOrigin: false } },
+  },
 });
