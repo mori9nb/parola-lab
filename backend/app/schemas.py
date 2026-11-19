@@ -33,6 +33,8 @@ class GenerationRequest(BaseModel):
 ] = Field(min_length=1, max_length=10)
     target_level: Literal["A1", "A2", "B1", "B2", "C1", "C2"]
     count: int = Field(default=3, ge=1, le=5)
+    kind: Literal["sentence"] | None = None
+    exclude: list[Annotated[str, Field(min_length=1, max_length=2000)]] = Field(default_factory=list, max_length=100)
 
 
 class GeneratedContent(ContentAnalysis):

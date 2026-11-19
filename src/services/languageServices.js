@@ -1,3 +1,4 @@
+import { apiFetch } from "./api";
 export async function analyzeInput(text) {
   const cleanedText = text.trim();
 
@@ -9,7 +10,7 @@ export async function analyzeInput(text) {
   const timeout = setTimeout(() => controller.abort(), 60_000);
 
   try {
-    const response = await fetch("/api/analyze", {
+    const response = await apiFetch("/api/analyze", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -67,12 +68,12 @@ export async function analyzeInput(text) {
     clearTimeout(timeout);
   }
 }
-export async function generateContent(seeds, targetLevel) {
+export async function generateContent(seeds, targetLevel, count = 3, exclude = []) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 60_000);
 
   try {
-    const response = await fetch("/api/generate", {
+    const response = await apiFetch("/api/generate", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -80,7 +81,9 @@ export async function generateContent(seeds, targetLevel) {
       body: JSON.stringify({
         seeds,
         target_level: targetLevel,
-        count: 3,
+        kind: "sentence",
+        count,
+        exclude,
       }),
       signal: controller.signal,
     });
@@ -97,7 +100,7 @@ export async function generateContent(seeds, targetLevel) {
 
     const valid =
       Array.isArray(data?.items) &&
-      data.items.length === 3 &&
+      data.items.length === count &&
       data.items.every(
         (item) =>
           ["text", "meaning", "example", "translation"].every(
@@ -126,12 +129,12 @@ export async function generateContent(seeds, targetLevel) {
   }
 }
 
-export async function generateGrammar(seeds, targetLevel) {
+export async function generateGrammar(seeds, targetLevel, count = 3, exclude = []) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 60_000);
 
   try {
-    const response = await fetch("/api/grammar/generate", {
+    const response = await apiFetch("/api/grammar/generate", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -139,7 +142,8 @@ export async function generateGrammar(seeds, targetLevel) {
       body: JSON.stringify({
         seeds,
         target_level: targetLevel,
-        count: 3,
+        count,
+        exclude,
       }),
       signal: controller.signal,
     });
@@ -154,7 +158,7 @@ export async function generateGrammar(seeds, targetLevel) {
       );
     }
 
-    if (!Array.isArray(data?.items) || data.items.length !== 3) {
+    if (!Array.isArray(data?.items) || data.items.length !== count) {
       throw new Error("پاسخ تمرین گرامر نامعتبر است.");
     }
 

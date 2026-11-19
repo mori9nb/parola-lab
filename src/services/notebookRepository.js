@@ -1,10 +1,11 @@
+import { apiFetch } from "./api";
 import { importNotebook } from './notebookServices';
 
 async function request(path, options = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 60000);
   try {
-    const response = await fetch(path, { ...options, signal: controller.signal });
+    const response = await apiFetch(path, { ...options, signal: controller.signal });
     if (response.status === 204) return null;
     const data = await response.json().catch(() => null);
     if (!response.ok) throw new Error(typeof data?.detail === 'string' ? data.detail : `خطای سرور: ${response.status}`);
@@ -72,10 +73,10 @@ export async function deleteNotebookItem(serverId) {
   return await request(`/api/items/${encodeURIComponent(serverId)}`, { method: 'DELETE' });
 }
 
-export async function submitNotebookReview(serverId, correct) {
+export async function submitNotebookReview(serverId, correct, attemptId) {
   if (!serverId) throw new Error('این آیتم هنوز به سرور وصل نشده است.');
   // Never automatically retry a review: the backend has no attempt IDs yet.
   return decodeReview(await request(`/api/items/${encodeURIComponent(serverId)}/review`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ correct }),
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ correct, ...(attemptId ? { attempt_id: attemptId } : {}) }),
   }));
 }

@@ -1,13 +1,12 @@
-"""Single-owner development API. Public multi-user auth is a later milestone."""
+"""Authenticated, user-scoped Parola API."""
 from datetime import datetime, timezone, timedelta
 from typing import Literal
-from uuid import uuid4
-from fastapi import FastAPI, Depends, HTTPException, Header
+from uuid import uuid4, UUID
+from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import UniqueConstraint, func,create_engine, String, Integer, DateTime, ForeignKey, select
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, Session
-import secrets
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+from app.grammar_storage_schemas import GrammarImportIn
 from app.notebook_schemas import NotebookImportIn
 from app.ai import (
     AnalysisError,
@@ -23,163 +22,66 @@ from app.schemas import (
     GrammarResult,
 )
 
-class Settings(BaseSettings):
-    database_url: str = 'postgresql+psycopg://parola:parola@db:5432/parola'
-    api_token: str = ''
-    model_config = SettingsConfigDict(env_file='.env', extra='ignore')
-settings = Settings()
-engine = create_engine(settings.database_url, pool_pre_ping=True)
-SessionLocal = sessionmaker(engine)
-class Base(DeclarativeBase): pass
-DEV_USER_ID = "00000000-0000-0000-0000-000000000001"
+from app.config import settings
+from app.database import Base, engine, SessionLocal, db
+from app.models import User, Item, Review, GrammarEntry, GrammarReview, DEV_USER_ID
+from app.auth import authorize, get_current_user_id, router as auth_router, enforce_request_origin
+from app.accounts import router as account_router, record_review
 
-
-class User(Base):
-    __tablename__ = "users"
-
-    id: Mapped[str] = mapped_column(
-        String(36),
-        primary_key=True,
-    )
-
-    display_name: Mapped[str] = mapped_column(
-        String(100),
-    )
-
-    email: Mapped[str | None] = mapped_column(
-        String(254),
-        unique=True,
-        nullable=True,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-    )
-class Item(Base):
-    __tablename__ = "items"
-
-    __table_args__ = (
-        UniqueConstraint(
-            "user_id",
-            "client_id",
-            name="uq_items_user_client",
-        ),
-    )
-
-    id: Mapped[str] = mapped_column(
-        String(36),
-        primary_key=True,
-    )
-
-    user_id: Mapped[str] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    client_id: Mapped[str | None] = mapped_column(
-        String(128),
-        nullable=True,
-    )
-
-    text: Mapped[str] = mapped_column(String(2000))
-    meaning: Mapped[str] = mapped_column(String(2000))
-    kind: Mapped[str] = mapped_column(String(16))
-
-    level: Mapped[str | None] = mapped_column(
-        String(2),
-        nullable=True,
-    )
-
-    source_language: Mapped[str] = mapped_column(
-        String(35),
-        default="fa",
-    )
-
-    target_language: Mapped[str] = mapped_column(
-        String(35),
-        default="it",
-    )
-
-    example: Mapped[str] = mapped_column(
-        String(3000),
-        default="",
-    )
-
-    translation: Mapped[str] = mapped_column(
-        String(3000),
-        default="",
-    )
-
-    tag: Mapped[str] = mapped_column(
-        String(100),
-        default="",
-    )
-
-    note: Mapped[str] = mapped_column(
-        String(3000),
-        default="",
-    )
-
-    origin: Mapped[str] = mapped_column(
-        String(16),
-        default="user",
-    )
-
-    source_text: Mapped[str] = mapped_column(
-        String(2000),
-        default="",
-    )
-
-    analysis_status: Mapped[str] = mapped_column(
-        String(20),
-        default="completed",
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-    )
-class Review(Base):
-    __tablename__ = 'reviews'
-    item_id: Mapped[str] = mapped_column(ForeignKey('items.id', ondelete='CASCADE'), primary_key=True)
-    streak: Mapped[int] = mapped_column(Integer, default=0)
-    attempts: Mapped[int] = mapped_column(Integer, default=0)
-    correct: Mapped[int] = mapped_column(Integer, default=0)
-    due: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 class ItemIn(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
     meaning: str = Field(min_length=1, max_length=2000)
-    kind: Literal['word','phrase','sentence'] = 'word'
-    level: Literal['A1','A2','B1','B2','C1','C2'] = 'A2'
-    source_language: str = Field(default='fa', min_length=2, max_length=35)
-    target_language: str = Field(default='it', min_length=2, max_length=35)
-    example: str = Field(default='', max_length=3000)
-    translation: str = Field(default='', max_length=3000)
-    tag: str = Field(default='', max_length=100)
-class ItemOut(ItemIn):
+
+    kind: Literal["word", "phrase", "sentence"] = "word"
+    level: Literal["A1", "A2", "B1", "B2", "C1", "C2"] = "A2"
+
+    source_language: str = Field(
+        default="fa", min_length=2, max_length=35
+    )
+    target_language: str = Field(
+        default="it", min_length=2, max_length=35
+    )
+
+    example: str = Field(default="", max_length=3000)
+    translation: str = Field(default="", max_length=3000)
+    tag: str = Field(default="", max_length=100)
+    note: str = Field(default="", max_length=3000)
+
+    origin: Literal["user", "ai", "starter"] = "user"
+    source_text: str = Field(default="", max_length=2000)
+
+
+class ItemOut(BaseModel):
+    model_config = {"from_attributes": True}
+
     id: str
-    model_config = {'from_attributes': True}
+    client_id: str | None
+
+    text: str
+    meaning: str
+    kind: Literal["word", "phrase", "sentence", "pending"]
+    level: Literal["A1", "A2", "B1", "B2", "C1", "C2"] | None
+
+    source_language: str
+    target_language: str
+    example: str
+    translation: str
+    tag: str
+    note: str
+    origin: str
+    source_text: str
+    analysis_status: str
+    created_at: datetime
 class Attempt(BaseModel):
     correct: bool
+    attempt_id: UUID | None = None
 
-def db():
-    with SessionLocal() as session: yield session
-
-def authorize(authorization: str = Header(default='')):
-    if not settings.api_token:
-        raise HTTPException(503, 'Set API_TOKEN before enabling the API')
-    if not secrets.compare_digest(authorization, f'Bearer {settings.api_token}'):
-        raise HTTPException(401, 'Invalid bearer token')
-def get_current_user_id(
-    _authorized=Depends(authorize),
-) -> str:
-    # فقط برای توسعهٔ محلی.
-    # بعداً شناسه از نشست احراز هویت‌شده گرفته می‌شود.
-    return DEV_USER_ID
-
-app = FastAPI(title='Parola Lab API', version='0.1.0')
+app = FastAPI(title="Parola Lab API", version="0.2.0")
+app.middleware("http")(enforce_request_origin)
+app.include_router(auth_router)
+app.include_router(account_router)
+from app.chat import router as chat_router
+app.include_router(chat_router)
 @app.post(
     "/api/notebook/import",
     dependencies=[Depends(authorize)],
@@ -330,9 +232,9 @@ def get_notebook(
         "items": items,
     }
 @app.get('/health')
-def health(): return {'status':'ok','version':'0.1.0'}
+def health(): return {'status':'ok','version':'0.2.0'}
 @app.get('/api/capabilities', dependencies=[Depends(authorize)])
-def capabilities(): return {'storage':'postgresql','ai':False,'speech':False,'push':False,'mode':'single-owner-development'}
+def capabilities(): return {'storage':'postgresql','ai':True,'speech':True,'chat':True,'push':False,'mode':'session-authenticated'}
 @app.get('/api/items', response_model=list[ItemOut], dependencies=[Depends(authorize)])
 def list_items(
     session: Session = Depends(db),
@@ -378,27 +280,7 @@ def review_item(
     session: Session = Depends(db),
     user_id: str = Depends(get_current_user_id),
 ):
-    # Lock the parent so concurrent attempts cannot overwrite review counters.
-    item = session.scalar(
-        select(Item)
-        .where(
-            Item.id == item_id,
-            Item.user_id == user_id,
-        )
-        .with_for_update()
-    )
-    if not item: raise HTTPException(404,'Item not found')
-    review=session.get(Review,item_id)
-    if review is None:
-        review=Review(item_id=item_id,streak=0,attempts=0,correct=0)
-        session.add(review)
-    review.attempts+=1
-    review.correct+=int(attempt.correct)
-    review.streak=review.streak+1 if attempt.correct else 0
-    interval=timedelta(days=min(30,2**min(review.streak-1,5))) if attempt.correct else timedelta(minutes=10)
-    review.due=datetime.now(timezone.utc)+interval
-    session.commit(); session.refresh(review)
-    return {'streak':review.streak,'attempts':review.attempts,'correct':review.correct,'due':review.due}
+    return record_review(session, user_id, "notebook", item_id, attempt.correct, attempt.attempt_id)
 
 class AnalysisRequest(BaseModel):
     model_config = {
@@ -451,3 +333,162 @@ async def generate_grammar_exercises(data: GenerationRequest):
             status_code=502,
             detail=str(exc),
         ) from exc
+
+@app.post(
+    "/api/grammar/import",
+    dependencies=[Depends(authorize)],
+)
+def import_grammar_bank(
+    data: GrammarImportIn,
+    session: Session = Depends(db),
+    user_id: str = Depends(get_current_user_id),
+):
+    created = 0
+    existing = 0
+    reviews_created = 0
+    mappings = []
+
+    try:
+        user = session.scalar(
+            select(User)
+            .where(User.id == user_id)
+            .with_for_update()
+        )
+
+        if user is None:
+            raise HTTPException(404, "User not found")
+
+        for incoming in sorted(
+            data.items,
+            key=lambda item: item.client_id,
+        ):
+            entry = session.scalar(
+                select(GrammarEntry)
+                .where(
+                    GrammarEntry.user_id == user_id,
+                    GrammarEntry.client_id == incoming.client_id,
+                )
+                .with_for_update()
+            )
+
+            if entry is None:
+                fields = incoming.model_dump(
+                    exclude={"created_at", "review"}
+                )
+
+                if incoming.created_at is not None:
+                    fields["created_at"] = incoming.created_at
+
+                entry = GrammarEntry(
+                    id=str(uuid4()),
+                    user_id=user_id,
+                    **fields,
+                )
+
+                session.add(entry)
+                session.flush()
+                created += 1
+            else:
+                existing += 1
+
+            if incoming.review is not None:
+                review = session.get(GrammarReview, entry.id)
+
+                # انتقال دوباره، پیشرفت سرور را بازنویسی نمی‌کند.
+                if review is None:
+                    session.add(
+                        GrammarReview(
+                            entry_id=entry.id,
+                            **incoming.review.model_dump(),
+                        )
+                    )
+                    reviews_created += 1
+
+            mappings.append(
+                {
+                    "client_id": incoming.client_id,
+                    "id": entry.id,
+                }
+            )
+
+        session.commit()
+
+    except Exception:
+        session.rollback()
+        raise
+
+    return {
+        "created": created,
+        "existing": existing,
+        "reviews_created": reviews_created,
+        "mappings": mappings,
+    }
+
+
+@app.get(
+    "/api/grammar/bank",
+    dependencies=[Depends(authorize)],
+)
+def get_grammar_bank(
+    session: Session = Depends(db),
+    user_id: str = Depends(get_current_user_id),
+):
+    rows = session.execute(
+        select(GrammarEntry, GrammarReview)
+        .outerjoin(
+            GrammarReview,
+            GrammarReview.entry_id == GrammarEntry.id,
+        )
+        .where(GrammarEntry.user_id == user_id)
+        .order_by(GrammarEntry.id)
+    ).all()
+
+    fields = (
+        "id",
+        "client_id",
+        "text",
+        "options",
+        "answer",
+        "meaning",
+        "explanation",
+        "level",
+        "source_text",
+        "origin",
+        "created_at",
+    )
+
+    items = []
+
+    for entry, review in rows:
+        item = {
+            field: getattr(entry, field)
+            for field in fields
+        }
+
+        item["review"] = (
+            {
+                "streak": review.streak,
+                "attempts": review.attempts,
+                "correct": review.correct,
+                "due": review.due,
+            }
+            if review is not None
+            else None
+        )
+
+        items.append(item)
+
+    return {"version": 1, "items": items}
+
+
+@app.post(
+    "/api/grammar/entries/{entry_id}/review",
+    dependencies=[Depends(authorize)],
+)
+def review_grammar_entry(
+    entry_id: str,
+    attempt: Attempt,
+    session: Session = Depends(db),
+    user_id: str = Depends(get_current_user_id),
+):
+    return record_review(session, user_id, "grammar", entry_id, attempt.correct, attempt.attempt_id)

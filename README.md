@@ -1,68 +1,44 @@
-# Parola Lab
+# Parola Lab 0.2 — pre-deployment test build
 
-An open-source personal language notebook and daily practice app. First learning pack: Persian → Italian. **v0.1.0 is the first vertical slice, not the full AI product.**
+An Italian learning notebook for Persian-speaking learners, with AI analysis/generation,
+user-owned PostgreSQL notebooks and grammar banks, persistent review history and account settings.
 
-## Available now
+Read [INSTALL_FA.md](INSTALL_FA.md) for the update and first-owner account setup.
+No deployment is performed by this update.
 
-- Responsive RTL React interface with notebook create/search/filter/delete.
-- Four-option vocabulary, phrase and sentence practice in both directions.
-- Curated Italian grammar exercises with Persian explanations.
-- Per-item review counters and simple spaced review scheduling (not FSRS).
-- Local progress, daily target, browser speech synthesis and JSON backup/import.
+## Local development
 
-The hosted preview stores data **only in the current browser**. Clearing site data removes it. Export a backup before changing device. The preview does not call an AI provider or the Python API. Italian speech synthesis depends on the device's available voices.
+Keep your existing `backend/.env`. Install frontend and backend dependencies, run
+`alembic upgrade head` from `backend`, then run `python -m app.manage create-owner`
+once to secure the existing development owner's data with real credentials.
+New public registrations always create separate, empty accounts.
 
-## Development
+From the project root, `python scripts/dev.py --port 5173` runs API and Vite together.
+The API uses HttpOnly cookie sessions; development bearer tokens no longer authorize requests.
 
-```sh
-npm ci
-npm run dev
-npm test
-npm run build
-```
+## Verification
 
-## Docker / backend foundation
+- `npm test` runs learning, repository, account transport and React component checks.
+- `npm run build` builds the complete frontend.
+- From `backend`: `python -m pytest tests -q`.
+- Set `TEST_POSTGRES_URL` to enable real PostgreSQL migration and concurrent-write checks.
+  CI supplies an isolated PostgreSQL 16 database for these checks.
 
-```sh
-cp .env.example .env
-# Replace both placeholder values locally; never commit .env.
-docker compose up --build
-```
+Migration 005 adds credentials, sessions, account preferences and practice history while
+preserving existing owner IDs, notebooks, grammar questions and review counters.
+Reviews and their history entry commit atomically; per-user attempt IDs prevent replayed
+requests from incrementing counters twice.
 
-Web: http://localhost:8080 · API docs: http://localhost:8000/docs.
+This remains a pre-deployment test build. HTTPS/Secure-cookie production configuration,
+email verification and email-based recovery are not deployed here. Local password reset
+is available via `python -m app.manage reset-password`.
+Tutor chat and Italian conversation now use Gemini with user-owned server history.
+The messenger composer supports text and direct voice messages (localhost/HTTPS recording
+or audio attachment). Voice is sent to Gemini with the conversation context in one request;
+Gemini responds naturally and supplies a transcript for the saved user bubble. No separate
+transcription step or assistant speech-synthesis playback controls. This is turn-based chat,
+not a live call or pronunciation scoring. Push notifications remain unimplemented.
 
-The FastAPI API has notebook CRUD, authenticated capability reporting and review scheduling. All `/api/*` endpoints require `Authorization: Bearer <API_TOKEN>`. It is a **single-owner development API**, not public multi-user authentication. Docker binds exposed ports to loopback. Alembic migrations run before API startup; PostgreSQL uses a named volume.
-
-**The UI still uses localStorage even under Docker.** Server synchronization and user accounts are the next milestone; the proxy alone does not connect the UI to PostgreSQL. API persistence and the frontend preview are independently usable foundations.
-
-Backend checks:
-
-```sh
-cd backend
-python -m venv .venv
-.venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest tests -q
-```
-
-## Repository
-
-- `src/`: React UI and framework-independent learning functions.
-- `backend/app/`: initial FastAPI service and relational models.
-- `backend/migrations/`: versioned database schema.
-- `tests/`, `backend/tests/`: quiz and API behavior checks.
-- `docs/`: architecture, decisions, milestones and evaluation plan.
-- `.github/workflows/ci.yml`: tests, production build and container builds.
-
-## Planned, not active
-
-Multi-user authentication; frontend ↔ server sync; LLM provider adapters; schema-validated exercise generation; chat tool calls; speech transcription and correction; Web Push scheduling; broader language packs; model evaluations and optional fine-tuning. UI labels explicitly identify unavailable features.
-
-The initial Italian content is illustrative; generated content will need validation. CEFR labels are content tags, not a certified level assessment. Current settings do not filter the curated exercises by CEFR.
-
-## Contributing
-
-Use small task branches and focused commits. Include tests for changes to scheduling, correctness, ownership and storage. Open a PR describing the resulting behavior and validation. Do not add user transcripts, recordings, keys or third-party copyrighted textbooks to the repository.
-
-## License
-
-Apache-2.0; see LICENSE. Model weights and imported content keep their own licenses. No third-party model weights are bundled.
+Word/phrase practice randomly reviews personal notebook entries, without generation.
+Sentence and grammar practice generate fresh notebook-based questions on every session;
+level controls difficulty only. See `PRACTICE_CHAT_UPDATE_FA.md` for installation.

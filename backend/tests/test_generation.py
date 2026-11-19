@@ -80,3 +80,13 @@ def test_duplicate_items_rejected(monkeypatch):
             [valid_item(), valid_item()],
             count=2,
         )
+
+
+def test_sentence_mode_rejects_words_and_recent_repeats(monkeypatch):
+    async def fake_request_json(**kwargs):
+        return json.dumps({'items':[valid_item()]})
+    monkeypatch.setattr(ai,'request_json',fake_request_json)
+    with pytest.raises(ai.AnalysisError):
+        asyncio.run(ai.generate_content(GenerationRequest(seeds=['avere bisogno di'],target_level='A1',count=1,kind='sentence')))
+    with pytest.raises(ai.AnalysisError):
+        asyncio.run(ai.generate_content(GenerationRequest(seeds=['avere bisogno di'],target_level='A1',count=1,exclude=['acqua'])))

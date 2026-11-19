@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-const source = (await readFile(new URL('../src/services/notebookRepository.js', import.meta.url), 'utf8')).replace("import { importNotebook } from './notebookServices';", 'const importNotebook = (...args) => globalThis.mockImport(...args);');
+const source = (await readFile(new URL('../src/services/notebookRepository.js', import.meta.url), 'utf8')).replace('import { apiFetch } from \"./api\";','const apiFetch = (...args) => globalThis.fetch(...args);').replace("import { importNotebook } from './notebookServices';", 'const importNotebook = (...args) => globalThis.mockImport(...args);');
 const { reconcileNotebook, decodeReview, fetchNotebook, persistNotebookItems, submitNotebookReview, deleteNotebookItem } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 const row = (extra={}) => ({ id:'uuid-1', client_id:'1', text:'Ciao', meaning:'سلام', kind:'word', level:'A1', note:'note', origin:'user', source_text:'', analysis_status:'completed', created_at:'2026-11-18T10:00:00Z', review:null, ...extra });
 const review = { attempts:5, correct:3, streak:0, due:'2026-11-18T10:00:00Z' };

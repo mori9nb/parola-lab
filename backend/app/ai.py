@@ -147,6 +147,9 @@ Each item must contain exactly:
 
 Rules:
 - Return exactly the requested count of distinct items.
+- If kind is sentence, EVERY item must be a new full sentence with kind sentence.
+- Never repeat any text in the supplied exclude list.
+- Incorporate the notebook vocabulary into varied everyday contexts.
 - Do not copy a seed as the new item's text.
 - Each item must be meaningfully related to its source_text.
 - The requested level applies to NEW content only.
@@ -182,13 +185,16 @@ async def generate_content(
         text.strip().casefold()
         for text in request.seeds
     }
-    generated_texts = set()
+    generated_texts = {text.strip().casefold() for text in request.exclude}
 
     for item in result.items:
         if item.source_text not in allowed_sources:
             raise AnalysisError(
                 "منبع یکی از موارد، در ورودی درخواست نیست."
             )
+
+        if request.kind == "sentence" and item.kind != "sentence":
+            raise AnalysisError("مدل باید فقط جملهٔ تازه تولید کند.")
 
         if item.level != request.target_level:
             raise AnalysisError(
@@ -229,6 +235,8 @@ Each item must contain exactly:
 
 Rules:
 - Return exactly the requested count of exercises.
+- Never repeat any text in the supplied exclude list.
+- Vary situations and grammatical structures using the supplied notebook material.
 - Each exercise must be related to its source_text.
 - There must be exactly ONE grammatically valid option
   in the context of the sentence.
@@ -284,7 +292,7 @@ async def generate_grammar(
         )
 
     allowed_sources = set(request.seeds)
-    seen_questions = set()
+    seen_questions = {text.strip().casefold() for text in request.exclude}
 
     for question in result.items:
         if question.source_text not in allowed_sources:

@@ -20,81 +20,63 @@ import {
   Sparkles,
   ChevronLeft,
   Leaf,
-  Download,
-  Upload,
   Mic,
   RotateCcw,
   GraduationCap,
   Globe,
   MoreHorizontal,
 } from "lucide-react";
-import { seed, grammar, makeQuestion, chooseItems, schedule,shuffle } from "./learning";
+import { makeQuestion, shuffle } from "./learning";
 import "./style.css";
+import { notebookSources, wordSession, generateFreshSession } from "./practicePolicy";
+import ChatPanel from "./ChatPanel";
+import AuthGate from "./AuthGate";
+import { readAccount, saveAccountPatch, recoverOwnerLegacy, signOut, changePassword } from "./services/accountServices";
 import {
   analyzeInput,
-  generateContent,
-  generateGrammar,
 } from "./services/languageServices";
-import { importNotebook } from "./services/notebookServices";
 import {
-  fetchNotebook, reconcileNotebook, persistNotebookItems,
+  persistNotebookItems,
   deleteNotebookItem, submitNotebookReview,
 } from "./services/notebookRepository";
-function read(key, fallback) {
-  try {
-    return JSON.parse(localStorage.getItem(key)) ?? fallback;
-  } catch {
-    return fallback;
-  }
-}
-function useStored(key, initial) {
-  const [v, set] = useState(() => read(key, initial));
-  return [
-    v,
-    (x) => {
-      set((old) => {
-        const next = typeof x === "function" ? x(old) : x;
-        localStorage.setItem(key, JSON.stringify(next));
-        return next;
-      });
-    },
-  ];
-}
+import {
+  persistGrammarEntries,
+  submitGrammarReview,
+} from "./services/grammarRepository";
+import { readExistingLearning, createClientId } from "./services/serverConnection";
 const labels = {
   word: "کلمه",
   phrase: "اصطلاح",
   sentence: "جمله",
   pending: "در انتظار تحلیل",
 };
-function App() {
+function App({ accountUser, onSignedOut }) {
   const [page, setPage] = useState("home");
-  const [serverEnabled, setServerEnabled] = useStored("parola.serverEnabled.v1", false);
   const [serverReady, setServerReady] = useState(false);
-  const [serverBusy, setServerBusy] = useState(false);
+  const [grammarReady, setGrammarReady] = useState(false);
+  const [serverBusy, setServerBusy] = useState(true);
+  const [loadError, setLoadError] = useState("");
   const serverLock = useRef(false);
   const reviewLock = useRef(false);
   const [savingReview, setSavingReview] = useState(false);
-  const initialLoad = useRef(false);
-  const [items, setItems] = useStored("parola.items.v1", seed);
-  const [progress, setProgress] = useStored("parola.progress.v1", {});
-  const [history, setHistory] = useStored("parola.history.v1", []);
-  const [settings, setSettings] = useStored("parola.settings.v1", {
+  const [items, setItems] = useState([]);
+  const [progress, setProgress] = useState({});
+  const [history, setHistory] = useState([]);
+  const [stats, setStats] = useState({ attempts: 0, correct: 0, practiced_days: 0, today: 0 });
+  const accountRef = useRef({ revision: 0, user: accountUser });
+  const accountWriteLock = useRef(false);
+  const [savingAccount, setSavingAccount] = useState(false);
+  const [settings, setSettings] = useState({
     level: "A2",
     daily: 10,
     base: "fa",
     target: "it",
   });
-  const [profile, setProfile] = useStored("parola.profile.v1", {
-    displayName: "",
+  const [profile, setProfile] = useState({
+    displayName: accountUser.display_name,
   });
-  const [grammarBank, setGrammarBank] = useStored(
-  "parola.grammarBank.v1",
-  grammar.map((question) => ({
-    ...question,
-    origin: "starter",
-  })),
-);
-  const [onboarded, setOnboarded] = useStored("parola.onboarding.v1", false);
+  const [grammarBank, setGrammarBank] = useState([]);
+  const [onboarded, setOnboarded] = useState(true);
   const displayName = profile.displayName.trim() || "زبان‌آموز";
   const [modal, setModal] = useState(false);
   const [filter, setFilter] = useState("all");
@@ -102,91 +84,132 @@ function App() {
   const [session, setSession] = useState(null);
   const [answer, setAnswer] = useState(null);
   const [notice, setNotice] = useState("");
-  const [chat, setChat] = useState("");
-  const [messages, setMessages] = useState([]);
-  const today = new Date().toLocaleDateString("en-CA");
-  const todayHistory = history.filter((x) => x.date === today);
-  const practiced = new Set(history.map((x) => x.date)).size;
-  const [transferring, setTransferring] = useState(false);
-  const transferLock = useRef(false);
+  const todayCount = stats.today;
+  const practiced = stats.practiced_days;
   const mastered = Object.values(progress).filter((x) => x.streak >= 3).length;
   const due = items.filter(
     (x) => !progress[x.id] || progress[x.id].due <= Date.now(),
   ).length;
   const [preparing, setPreparing] = useState(false);
+  const [preparingText, setPreparingText] = useState("");
   const preparingLock = useRef(false);
 
-  const [generationDays, setGenerationDays] = useStored(
-    "parola.generationDays.v1",
-    {},
-  );
-  const accuracy = history.length
-    ? Math.round(
-        (history.filter((x) => x.correct).length / history.length) * 100,
-      )
-    : 0;
+  const accuracy = stats.attempts ? Math.round(stats.correct / stats.attempts * 100) : 0;
   function toast(s) {
     setNotice(s);
     setTimeout(() => setNotice(""), 4000);
   }
-  function applySnapshot(rows, currentItems = items, currentProgress = progress) {
-    const decoded = reconcileNotebook(rows, currentItems, currentProgress, grammarBank.map(q => q.id));
-    setItems(decoded.items);
-    setProgress(decoded.progress);
-    return decoded;
+  function applyAccount(account) {
+    accountRef.current = account;
+    setSettings(account.settings);
+    setProfile({ displayName: account.user.display_name });
+    setOnboarded(account.onboarded);
+    setHistory(account.history);
+    setStats(account.stats);
+  }
+  async function updateAccount(patch, silent = false) {
+    if (accountWriteLock.current) throw new Error("ذخیرهٔ تنظیمات قبلی هنوز تمام نشده است.");
+    accountWriteLock.current = true;
+    setSavingAccount(true);
+    try {
+      const account = await saveAccountPatch(patch, accountRef.current.revision);
+      applyAccount(account);
+      if (!silent) toast("تغییرات ذخیره شد.");
+      return account;
+    } catch (error) {
+      if (error.status === 409) applyAccount(await readAccount());
+      if (!silent) toast(error.message);
+      throw error;
+    } finally { accountWriteLock.current = false; setSavingAccount(false); }
+  }
+  function updatePreference(patch) { updateAccount(patch).catch(() => {}); }
+  async function logout() {
+    if (serverLock.current || reviewLock.current || preparingLock.current || accountWriteLock.current) return;
+    setServerBusy(true);
+    try { await signOut(); onSignedOut(); }
+    catch (error) { setServerBusy(false); toast(error.message); }
+  }
+  async function refreshLearning(isCancelled = () => false) {
+    if (serverLock.current || reviewLock.current || preparingLock.current || accountWriteLock.current) return;
+    serverLock.current = true;
+    setServerBusy(true);
+    setLoadError("");
+    try {
+      let account = await readAccount();
+      try { account = await recoverOwnerLegacy(account); }
+      catch (error) {
+        if (error.status === 401) throw error;
+        toast("بعضی داده‌های قدیمی مرورگر منتقل نشدند؛ نسخهٔ قبلی حفظ شده است.");
+      }
+      const decoded = await readExistingLearning({ items, bank: grammarBank, progress });
+      if (isCancelled()) return;
+      applyAccount(account);
+      setItems(decoded.items);
+      setGrammarBank(decoded.bank);
+      setProgress(decoded.progress);
+      setServerReady(true);
+      setGrammarReady(true);
+      setSession(null);
+      setAnswer(null);
+    } catch (error) {
+      if (isCancelled()) return;
+      setServerReady(false);
+      setGrammarReady(false);
+      setLoadError(error.message || "دریافت اطلاعات انجام نشد.");
+    } finally {
+      if (!isCancelled()) {
+        serverLock.current = false;
+        setServerBusy(false);
+      }
+    }
   }
   useEffect(() => {
-    if (!serverEnabled || initialLoad.current) return;
-    initialLoad.current = true;
     let cancelled = false;
-    setServerBusy(true);
-    serverLock.current = true;
-    fetchNotebook().then(rows => {
-      if (cancelled) return;
-      applySnapshot(rows);
-      setServerReady(true);
-    }).catch(error => {
-      if (!cancelled) { setServerReady(false); toast(error.message); }
-    }).finally(() => {
-      if (!cancelled) { setServerBusy(false); serverLock.current = false; }
-    });
-    return () => { cancelled = true; };
+    refreshLearning(() => cancelled);
+    return () => { cancelled = true; serverLock.current = false; };
   }, []);
-  async function saveNotebookItem(item) {
-    if (!serverEnabled) {
-      setItems(current => [...current, { ...item, id: crypto.randomUUID() }]);
-    } else {
-      if (!serverReady || serverLock.current) throw new Error("ابتدا دفترچه را از سرور بازخوانی کن.");
-      const candidate = { ...item, id: crypto.randomUUID(), origin: item.origin ?? "user", createdAt: new Date().toISOString() };
-      // The stable client ID is saved on the server; refresh recovers a lost response.
-      serverLock.current = true;
-      setServerBusy(true);
-      try {
-        const saved = await persistNotebookItems([candidate]);
-        setItems(current => [...current, ...saved.filter(x => !current.some(y => y.id === x.id))]);
-      } catch (error) {
-        setServerReady(false);
-        throw error;
-      } finally { serverLock.current = false; setServerBusy(false); }
+  useEffect(() => {
+    function refreshWhenVisible() {
+      if (document.visibilityState === "hidden" || session || modal || profile.displayName !== accountRef.current.user.display_name) return;
+      refreshLearning();
     }
-    setModal(false);
-    toast("به دفترچه اضافه شد.");
+    window.addEventListener?.("focus", refreshWhenVisible);
+    document.addEventListener?.("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.removeEventListener?.("focus", refreshWhenVisible);
+      document.removeEventListener?.("visibilitychange", refreshWhenVisible);
+    };
+  }, [session, modal, items, grammarBank, progress, profile.displayName]);
+  async function saveNotebookItem(item) {
+    if (!serverReady || !grammarReady || serverLock.current || preparingLock.current) throw new Error("ارتباط با سرور برقرار نیست؛ دوباره تلاش کن.");
+    const candidate = { ...item, id: createClientId(), origin: item.origin ?? "user", createdAt: new Date().toISOString() };
+    serverLock.current = true;
+    setServerBusy(true);
+    try {
+      const saved = await persistNotebookItems([candidate]);
+      setItems(current => [...current, ...saved.filter(x => !current.some(y => y.id === x.id))]);
+      setModal(false);
+      toast("به دفترچه اضافه شد.");
+    } catch (error) {
+      setServerReady(false);
+      setLoadError(error.message || "ثبت در سرور تأیید نشد.");
+      throw error;
+    } finally { serverLock.current = false; setServerBusy(false); }
   }
   async function removeNotebookItem(item) {
+    if (!serverReady || serverLock.current || preparingLock.current) return;
     if (!confirm("این مورد از دفترچه حذف شود؟")) return;
-    if (!serverEnabled) {
-      setItems(current => current.filter(x => x.id !== item.id));
-      return;
-    }
-    if (!serverReady || serverLock.current) return toast("ابتدا دفترچه را از سرور بازخوانی کن.");
     serverLock.current = true;
     setServerBusy(true);
     try {
       await deleteNotebookItem(item.serverId);
       setItems(current => current.filter(x => x.id !== item.id));
       setProgress(current => { const next = { ...current }; delete next[item.id]; return next; });
-    } catch (error) { setServerReady(false); toast(error.message); }
-    finally { serverLock.current = false; setServerBusy(false); }
+    } catch (error) {
+      setServerReady(false);
+      setLoadError(error.message || "حذف تأیید نشد.");
+      toast(error.message);
+    } finally { serverLock.current = false; setServerBusy(false); }
   }
   function speak(text) {
     if (!("speechSynthesis" in window))
@@ -197,474 +220,81 @@ function App() {
     u.rate = 0.85;
     speechSynthesis.speak(u);
   }
-  async function prepareGrammarSession() {
-  const level = settings.level;
-  const limit = Number(settings.daily);
-  const freshLimit = Math.min(3, Math.floor(limit / 3));
-
-  const now = new Date();
-  const dayKey = [
-    now.getFullYear(),
-    now.getMonth() + 1,
-    now.getDate(),
-  ].join("-");
-
-  const generationKey = `grammar:${level}`;
-
-  const normalize = (text) =>
-    text.trim().toLocaleLowerCase("it");
-
-  let bank = [...grammarBank];
-
-  const unused = bank.filter(
-    (question) =>
-      question.origin === "ai" &&
-      question.level === level &&
-      !progress[question.id]?.attempts,
-  );
-
-  const needsGeneration =
-    unused.length < freshLimit &&
-    generationDays[generationKey] !== dayKey;
-
-  if (needsGeneration) {
-    const personalItems = items.filter(
-      (item) =>
-        item.kind !== "pending" &&
-        item.origin !== "ai" &&
-        item.text?.trim() &&
-        item.meaning?.trim(),
-    );
-
-    const seeds = [
-      ...new Set(
-        chooseItems(personalItems, progress, 10).map(
-          (item) => item.text.trim(),
-        ),
-      ),
-    ];
-
-    if (seeds.length) {
-      try {
-        const generated = await generateGrammar(seeds, level);
-
-        const seen = new Set(
-          bank.map((question) => normalize(question.text)),
-        );
-
-        const additions = generated
-          .filter((question) => {
-            const key = normalize(question.text);
-
-            if (seen.has(key)) return false;
-
-            seen.add(key);
-            return true;
-          })
-          .map((question) => ({
-            ...question,
-            id: crypto.randomUUID(),
-            origin: "ai",
-            createdAt: new Date().toISOString(),
-          }));
-
-        if (additions.length) {
-          setGrammarBank((current) => {
-            const existing = new Set(
-              current.map((question) =>
-                normalize(question.text),
-              ),
-            );
-
-            return [
-              ...current,
-              ...additions.filter(
-                (question) =>
-                  !existing.has(normalize(question.text)),
-              ),
-            ];
-          });
-
-          bank = [...bank, ...additions];
-        }
-
-        setGenerationDays((current) => ({
-          ...current,
-          [generationKey]: dayKey,
-        }));
-      } catch {
-        toast(
-          "گرامر تازه آماده نشد؛ از سؤال‌های ذخیره‌شده استفاده می‌کنیم.",
-        );
-      }
-    }
-  }
-
-  const eligible = bank.filter(
-    (question) =>
-      question.origin === "starter" ||
-      question.level === level ||
-      progress[question.id]?.attempts > 0,
-  );
-
-  const fresh = chooseItems(
-    eligible.filter(
-      (question) =>
-        question.origin === "ai" &&
-        question.level === level &&
-        !progress[question.id]?.attempts,
-    ),
-    progress,
-    freshLimit,
-  );
-
-  const freshIds = new Set(
-    fresh.map((question) => question.id),
-  );
-
-  const review = chooseItems(
-    eligible.filter(
-      (question) => !freshIds.has(question.id),
-    ),
-    progress,
-    limit - fresh.length,
-  );
-
-  return [...fresh, ...review].map((question) => ({
-    ...question,
-    prompt: question.text,
-    grammar: true,
-    options: shuffle(question.options),
-  }));
-}
-  async function start(mode = "mix") {
-    if (preparingLock.current || serverLock.current || reviewLock.current) return;
-    if (serverEnabled && !serverReady && mode !== "grammar") return toast("ابتدا دفترچه را از سرور بازخوانی کن.");
-
+  async function start(mode = "word") {
+    if (preparingLock.current || serverLock.current || reviewLock.current || accountWriteLock.current) return;
+    if (!serverReady || !grammarReady) return toast("ارتباط با سرور برقرار نیست؛ دوباره تلاش کن.");
     preparingLock.current = true;
     setPreparing(true);
-
+    setPreparingText("مرور تصادفی کلمات دفترچه…");
     try {
-      // گرامر فعلاً از مجموعهٔ فعلی استفاده می‌کند.
-      if (mode === "grammar") {
-        const questions = await prepareGrammarSession();
-
-        if (!questions.length) {
-          toast("هنوز تمرین گرامری موجود نیست.");
-          return;
-        }
-
-        setSession({
-          questions,
-          index: 0,
-          score: 0,
-          mode,
-        });
-        setAnswer(null);
-        setPage("practice");
-        return;
-      }
-
-      const level = settings.level;
+      const personal = notebookSources(items);
       const limit = Number(settings.daily);
-      const freshLimit = Math.min(3, Math.floor(limit / 3));
-
-      const now = new Date();
-      const dayKey = [
-        now.getFullYear(),
-        now.getMonth() + 1,
-        now.getDate(),
-      ].join("-");
-
-      const normalize = (text) =>
-        text.trim().toLocaleLowerCase("it");
-
-      const isReady = (item) =>
-        item.kind !== "pending" &&
-        typeof item.meaning === "string" &&
-        item.meaning.trim().length > 0;
-
-      const matchesMode = (item) =>
-        mode === "sentence"
-          ? item.kind === "sentence"
-          : mode === "word"
-            ? item.kind !== "sentence"
-            : true;
-
-      let ready = items.filter(isReady);
-
-      const unusedGenerated = ready.filter(
-        (item) =>
-          item.origin === "ai" &&
-          item.level === level &&
-          !progress[item.id]?.attempts &&
-          matchesMode(item),
-      );
-
-      const needsGeneration =
-        unusedGenerated.length < freshLimit &&
-        generationDays[level] !== dayKey;
-
-      if (needsGeneration) {
-        // تنوع مبنا: ورودی‌های کمتر تمرین‌شده اولویت دارند.
-        const personalItems = ready.filter(
-          (item) => item.origin !== "ai",
-        );
-
-        const candidateSeeds = chooseItems(
-          personalItems,
-          progress,
-          10,
-        );
-
-        const seeds = [
-          ...new Set(candidateSeeds.map((item) => item.text.trim())),
-        ];
-
-        if (seeds.length) {
-          try {
-            const generated = await generateContent(seeds, level);
-
-            const seen = new Set(
-              items.map((item) => normalize(item.text)),
-            );
-
-            const additions = generated
-              .filter((item) => {
-                const key = normalize(item.text);
-
-                if (seen.has(key)) return false;
-
-                seen.add(key);
-                return true;
-              })
-              .map((item) => ({
-                ...item,
-                id: crypto.randomUUID(),
-                origin: "ai",
-                analysisStatus: "completed",
-                tag: "پیشنهاد مدل",
-                createdAt: new Date().toISOString(),
-              }));
-
-            if (additions.length) {
-              let savedAdditions = additions;
-              if (serverEnabled) {
-                try { savedAdditions = await persistNotebookItems(additions); }
-                catch (error) { setServerReady(false); throw error; }
-              }
-              setItems((current) => {
-                const existing = new Set(
-                  current.map((item) => normalize(item.text)),
-                );
-
-                return [
-                  ...current,
-                  ...savedAdditions.filter(
-                    (item) => !existing.has(normalize(item.text)),
-                  ),
-                ];
-              });
-
-              // از نتیجهٔ همین درخواست استفاده می‌کنیم؛
-              // منتظر به‌روزرسانی state نمی‌مانیم.
-              ready = [...ready, ...savedAdditions];
-            }
-
-            setGenerationDays((current) => ({
-              ...current,
-              [level]: dayKey,
-            }));
-          } catch (error) {
-            if (serverEnabled) { toast(error.message || "آماده‌سازی انجام نشد؛ دفترچه را بازخوانی کن."); return; }
-            toast("محتوای تازه آماده نشد؛ تمرین با مطالب موجود ادامه دارد.");
-          }
+      let questions;
+      if (mode === "grammar" || mode === "sentence") {
+        if (!personal.length) throw new Error("اول چند کلمه، اصطلاح یا جمله به دفترچه اضافه کن.");
+        const seeds = [...new Set(shuffle(personal).slice(0, 10).map(x => x.text.trim()))];
+        const previous = mode === "grammar" ? grammarBank : items.filter(x => x.origin === "ai");
+        const exclude = [...previous].sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || ""))).slice(-100).map(x => x.text);
+        const generated = await generateFreshSession(mode, seeds, settings.level, limit, exclude, (done, total) => setPreparingText(`تولید سؤال‌های تازه: ${done} از ${total} آماده است…`));
+        if (mode === "sentence" && new Set(generated.map(x => x.meaning.trim())).size < 4) throw new Error("مدل معنی‌های متمایز کافی نساخت؛ دوباره تلاش کن.");
+        const additions = generated.map(x => ({ ...x, id: createClientId(), origin: "ai", analysisStatus: "completed", createdAt: new Date().toISOString() }));
+        if (mode === "grammar") {
+          const saved = await persistGrammarEntries(additions);
+          setGrammarBank(current => [...current, ...saved]);
+          questions = saved.map(x => ({ ...x, prompt: x.text, grammar: true, options: shuffle(x.options) }));
+        } else {
+          const saved = await persistNotebookItems(additions);
+          setItems(current => [...current, ...saved]);
+          questions = saved.map(x => makeQuestion(x, saved));
+          if (questions.some(x => !x)) throw new Error("معنی‌های تولیدشده برای سؤال چهارگزینه‌ای کافی نیست؛ دوباره تلاش کن.");
         }
+      } else {
+        questions = wordSession(items, limit, mode === "reverse");
+        if (!questions.length) throw new Error("برای تمرین چهارگزینه‌ای، حداقل چهار کلمه یا اصطلاح با معنی متفاوت به دفترچه اضافه کن.");
       }
-
-      const pool = ready.filter(matchesMode);
-      const reverse = mode === "reverse";
-
-      // اول سؤال‌های قابل‌ساخت را مشخص می‌کنیم.
-      const questionsById = new Map();
-
-      for (const item of pool) {
-        const question = makeQuestion(item, ready, reverse);
-
-        if (question) {
-          questionsById.set(item.id, question);
-        }
-      }
-
-      const eligible = pool.filter((item) =>
-        questionsById.has(item.id),
-      );
-
-      const fresh = chooseItems(
-        eligible.filter(
-          (item) =>
-            item.origin === "ai" &&
-            item.level === level &&
-            !progress[item.id]?.attempts,
-        ),
-        progress,
-        freshLimit,
-      );
-
-      const freshIds = new Set(fresh.map((item) => item.id));
-
-      const review = chooseItems(
-        eligible.filter((item) => !freshIds.has(item.id)),
-        progress,
-        limit - fresh.length,
-      );
-
-      const questions = [...fresh, ...review].map((item) =>
-        questionsById.get(item.id),
-      );
-
-      if (!questions.length) {
-        toast(
-          "هنوز محتوای کافی برای ساخت سؤال چهارگزینه‌ای نداریم.",
-        );
-        return;
-      }
-
-      setSession({
-        questions,
-        index: 0,
-        score: 0,
-        mode,
-      });
+      setSession({ questions, index: 0, score: 0, mode });
       setAnswer(null);
       setPage("practice");
+    } catch (error) {
+      toast(error.message || "تمرین تازه آماده نشد؛ دوباره تلاش کن.");
     } finally {
       preparingLock.current = false;
       setPreparing(false);
     }
   }
   async function submit(value) {
-    if (answer !== null || reviewLock.current || !session) return;
+    if (answer !== null || reviewLock.current || serverLock.current || preparingLock.current || accountWriteLock.current || !session) return;
     const q = session.questions[session.index];
     const correct = value === q.answer;
     reviewLock.current = true;
     setSavingReview(true);
     try {
       let updated;
-      if (!q.grammar && serverEnabled) {
-        if (!serverReady) throw new Error("ابتدا دفترچه را از سرور بازخوانی کن.");
-        updated = await submitNotebookReview(q.item.serverId, correct);
-      } else updated = schedule(progress[q.id], correct);
+      if (q.grammar) {
+        if (!grammarReady) throw new Error("ارتباط با سرور برقرار نیست؛ دوباره تلاش کن.");
+        updated = await submitGrammarReview(q.serverId, correct, createClientId());
+      } else {
+        if (!serverReady) throw new Error("ارتباط با سرور برقرار نیست؛ دوباره تلاش کن.");
+        updated = await submitNotebookReview(q.item.serverId, correct, createClientId());
+      }
       setProgress(current => ({ ...current, [q.id]: updated }));
-      setHistory(current => [...current, { id: q.id, correct, date: today, at: Date.now() }]);
+      applyAccount(await readAccount());
       setSession(current => current ? { ...current, score: current.score + Number(correct) } : current);
       setAnswer(value);
     } catch (error) {
       // Do not repeat an attempt whose response may have been lost.
-      setServerReady(false);
+      if (q.grammar) setGrammarReady(false);
+      else setServerReady(false);
       setSession(null);
       setAnswer(null);
-      toast(`${error.message} تمرین متوقف شد؛ از تنظیمات دفترچه را بازخوانی کن.`);
+      setLoadError(error.message || "ثبت پاسخ تأیید نشد.");
+      toast("ثبت پاسخ تأیید نشد؛ ارتباط را دوباره بررسی کن.");
     } finally { reviewLock.current = false; setSavingReview(false); }
   }
   function next() {
     if (reviewLock.current) return;
     setSession((s) => ({ ...s, index: s.index + 1 }));
     setAnswer(null);
-  }
-  async function transferNotebook() {
-    if (transferLock.current || serverLock.current || reviewLock.current || preparingLock.current) return;
-    transferLock.current = true;
-    serverLock.current = true;
-    setTransferring(true);
-    setServerBusy(true);
-    try {
-      if (!serverEnabled) {
-        // Retain the original cache as a separate recovery checkpoint.
-        localStorage.setItem("parola.beforeServer.v1", JSON.stringify({ items, progress, history, grammarBank, settings, profile, generationDays }));
-        if (items.length) await importNotebook(items, progress);
-      }
-      const rows = await fetchNotebook();
-      applySnapshot(rows);
-      setSession(null);
-      setAnswer(null);
-      setServerEnabled(true);
-      setServerReady(true);
-      toast("دفترچه به سرور متصل شد؛ گرامر و تاریخچه همچنان محلی‌اند.");
-    } catch (error) { setServerReady(false); toast(error.message || "اتصال انجام نشد."); }
-    finally {
-      transferLock.current = false;
-      serverLock.current = false;
-      setTransferring(false);
-      setServerBusy(false);
-    }
-  }
-  function exportData() {
-    const url = URL.createObjectURL(
-      new Blob(
-        [
-          JSON.stringify(
-            {
-  version: 2,
-  items,
-  grammarBank,
-  progress,
-  history,
-  settings,
-  profile,
-  generationDays,
-},
-            null,
-            2,
-          ),
-        ],
-        { type: "application/json" },
-      ),
-    );
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "parola-backup.json";
-    a.click();
-    URL.revokeObjectURL(url);
-  }
-  function importData(e) {
-    if (serverEnabled) {
-      e.target.value = "";
-      toast("بازیابی فایل در حالت اتصال به سرور هنوز فعال نیست؛ پشتیبان را نگه دار.");
-      return;
-    }
-    const f = e.target.files[0];
-    if (!f) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const d = JSON.parse(reader.result);
-        if (
-          !Array.isArray(d.items) ||
-          !d.items.every(
-            (x) =>
-              typeof x.id === "string" &&
-              typeof x.text === "string" &&
-              typeof x.meaning === "string" &&
-              labels[x.kind] &&
-              (x.level === null ||
-                ["A1", "A2", "B1", "B2", "C1", "C2"].includes(x.level)),
-          )
-        )
-          throw Error();
-        setItems(d.items);
-        if (Array.isArray(d.grammarBank)) {
-          setGrammarBank(d.grammarBank);
-        }
-        setProgress(d.progress || {});
-        setHistory(Array.isArray(d.history) ? d.history : []);
-        toast("دفترچه با موفقیت بازیابی شد.");
-      } catch {
-        toast("فایل پشتیبان معتبر نیست.");
-      }
-    };
-    reader.readAsText(f);
-    e.target.value = "";
   }
   const nav = [
     ["home", LayoutDashboard, "خانه"],
@@ -744,7 +374,7 @@ function App() {
           </div>
           <div className="top-actions">
             <span className="local-status">
-              <span /> {serverEnabled ? (serverReady ? "دفترچه متصل به سرور" : "دفترچه نیاز به بازخوانی دارد") : "ذخیره روی این دستگاه"}
+              <span /> {serverBusy ? "در حال دریافت اطلاعات…" : serverReady && grammarReady ? "ذخیرهٔ خودکار" : "ارتباط برقرار نیست"}
             </span>
             <span className="date">
               {new Date().toLocaleDateString("fa-IR", {
@@ -755,10 +385,10 @@ function App() {
           </div>
         </header>
         <div className="content">
-          {serverEnabled && !serverReady && !serverBusy && (
+          {loadError && !serverBusy && (
             <div role="alert" className="connection-note">
-              <p>اتصال دفترچه تأیید نشده؛ نسخهٔ ذخیره‌شده فقط برای مشاهده است.</p>
-              <button className="button outline" onClick={transferNotebook}>بازخوانی از سرور</button>
+              <p>{loadError}</p>
+              <button className="button outline" onClick={() => refreshLearning()}>تلاش دوباره</button>
             </div>
           )}
           {page === "home" && (
@@ -774,6 +404,7 @@ function App() {
                 </div>
                 <button
                   className="button outline"
+                  disabled={!serverReady || !grammarReady || serverBusy}
                   onClick={() => setModal(true)}
                 >
                   <Plus size={18} /> افزودن به دفترچه
@@ -796,7 +427,7 @@ function App() {
                       تا جمله‌هایی که واقعاً به کارت میان.
                     </p>
                     <button className="button cream" onClick={() => start()}>
-                      شروع تمرین امروز <ArrowUpLeft size={19} />
+                      مرور کلمات دفترچه <ArrowUpLeft size={19} />
                     </button>
                     <div className="hero-meta">
                       <Clock3 size={14} /> حدود ۵ دقیقه <span>•</span> تا{" "}
@@ -832,19 +463,19 @@ function App() {
                   <div
                     className="progress-ring"
                     style={{
-                      "--p": `${Math.min(100, (todayHistory.length / Number(settings.daily)) * 100)}%`,
+                      "--p": `${Math.min(100, (todayCount / Number(settings.daily)) * 100)}%`,
                     }}
                   >
                     <div>
                       <strong>
-                        {todayHistory.length}
+                        {todayCount}
                         <span> / {settings.daily}</span>
                       </strong>
                       <small>تمرین انجام‌شده</small>
                     </div>
                   </div>
                   <p>
-                    {todayHistory.length
+                    {todayCount
                       ? "آفرین، همین‌طور ادامه بده!"
                       : "هنوز اول راه امروزیم!"}
                   </p>
@@ -893,7 +524,7 @@ function App() {
                   icon="Aa"
                   color="sage"
                   title="کلمه و اصطلاح"
-                  desc="معنی رو پیدا کن، توی ذهنت نگه دار."
+                  desc="مرور تصادفی کلمات و اصطلاحات دفترچه؛ بدون تولید جدید"
                   badge="چهارگزینه‌ای"
                   onClick={() => start("word")}
                 />
@@ -901,7 +532,7 @@ function App() {
                   icon="“ ”"
                   color="peach"
                   title="جمله‌های کاربردی"
-                  desc="از معنی جمله تا گفت‌وگوی واقعی."
+                  desc="هر جلسه جمله‌های تازه از محتوای دفترچه"
                   badge="چهارگزینه‌ای"
                   onClick={() => start("sentence")}
                 />
@@ -909,7 +540,7 @@ function App() {
                   icon="___"
                   color="lilac"
                   title="یک جای خالی کوچک"
-                  desc="ساختار درست رو بذار سر جاش."
+                  desc="هر جلسه جای خالی تازه از محتوای دفترچه"
                   badge="گرامر"
                   onClick={() => start("grammar")}
                 />
@@ -958,7 +589,8 @@ function App() {
                 action={
                   <button
                     className="button primary"
-                    onClick={() => setModal(true)}
+                    disabled={!serverReady || !grammarReady || serverBusy}
+                  onClick={() => setModal(true)}
                   >
                     <Plus size={18} /> مورد جدید
                   </button>
@@ -1012,7 +644,7 @@ function App() {
                 <div className="empty">اولین کلمه‌ات رو اضافه کن.</div>
               )}
               <div className="storage-note">
-                {serverEnabled ? "دفترچه و مرور لغت روی سرور ذخیره می‌شوند؛ گرامر، تاریخچه و تنظیمات محلی‌اند." : "اطلاعات روی همین دستگاه است؛ از تنظیمات می‌توانی دفترچه را به سرور وصل کنی."}
+                دفترچه، گرامر و پیشرفت مرور به‌صورت خودکار ذخیره می‌شوند.
               </div>
             </>
           )}
@@ -1029,7 +661,7 @@ function App() {
                     icon="Aa"
                     color="sage"
                     title="کلمه و اصطلاح"
-                    desc="ایتالیایی به فارسی"
+                    desc="مرور تصادفی دفترچه؛ ایتالیایی به فارسی"
                     badge="شروع تمرین"
                     onClick={() => start("word")}
                   />
@@ -1037,7 +669,7 @@ function App() {
                     icon="↔"
                     color="blue"
                     title="مرور برعکس"
-                    desc="فارسی به ایتالیایی"
+                    desc="مرور تصادفی کلمات دفترچه؛ فارسی به ایتالیایی"
                     badge="شروع تمرین"
                     onClick={() => start("reverse")}
                   />
@@ -1045,7 +677,7 @@ function App() {
                     icon="“ ”"
                     color="peach"
                     title="جمله‌ها"
-                    desc="معنی جمله را پیدا کن"
+                    desc="هر جلسه جملهٔ تازه؛ متناسب با سطح تو"
                     badge="شروع تمرین"
                     onClick={() => start("sentence")}
                   />
@@ -1053,7 +685,7 @@ function App() {
                     icon="___"
                     color="lilac"
                     title="گرامر"
-                    desc="جای خالی را کامل کن"
+                    desc="هر جلسه گرامر تازه؛ متناسب با سطح تو"
                     badge="شروع تمرین"
                     onClick={() => start("grammar")}
                   />
@@ -1098,101 +730,8 @@ function App() {
               )}
             </>
           )}
-          {page === "chat" && (
-            <>
-              <PageTitle
-                eyebrow="IL TUO COMPAGNO"
-                title="دستیار زبان"
-                desc="معنی، گرامر و مثال؛ کنار دفترچهٔ شخصی تو."
-              />
-              <div className="connection-note">
-                <Sparkles size={19} />
-                <div>
-                  <strong>اتصال مدل هنوز تنظیم نشده</strong>
-                  <p>
-                    در این نسخه می‌توانی در دفترچه جست‌وجو کنی. چت آزاد و تولید
-                    محتوا بعد از تنظیم API در بک‌اند فعال می‌شوند.
-                  </p>
-                </div>
-              </div>
-              <div className="chat-box">
-                <div className="chat-welcome">
-                  <MessageCircle size={32} />
-                  <h3>کدوم عبارت رو با هم مرور کنیم؟</h3>
-                  <p>یک کلمه مثل «bisogno» یا یک معنی مثل «مراقبت» بنویس.</p>
-                </div>
-                {messages.map((m, i) => (
-                  <div key={i} className={`message ${m.role}`}>
-                    <p dir="auto">{m.text}</p>
-                  </div>
-                ))}
-                <form
-                  className="chat-input"
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    if (!chat.trim()) return;
-                    const q = chat.trim();
-                    const found = items.filter((x) =>
-                      `${x.text} ${x.meaning}`
-                        .toLowerCase()
-                        .includes(q.toLowerCase()),
-                    );
-                    setMessages((m) => [
-                      ...m,
-                      { role: "user", text: q },
-                      {
-                        role: "assistant",
-                        text: found.length
-                          ? found
-                              .map(
-                                (x) =>
-                                  `${x.text}\n${x.meaning}\n${x.example || ""}\n${x.translation || ""}`,
-                              )
-                              .join("\n\n")
-                          : "این مورد در دفترچه نیست. می‌تونی با دکمهٔ «مورد جدید» اضافه‌اش کنی. پاسخ هوشمند به اتصال مدل نیاز دارد.",
-                      },
-                    ]);
-                    setChat("");
-                  }}
-                >
-                  <input
-                    value={chat}
-                    onChange={(e) => setChat(e.target.value)}
-                    placeholder="در دفترچه‌ات جست‌وجو کن…"
-                  />
-                  <button className="button primary" aria-label="ارسال">
-                    <ArrowUpLeft size={20} />
-                  </button>
-                </form>
-              </div>
-            </>
-          )}
-          {page === "speech" && (
-            <>
-              <PageTitle
-                eyebrow="PARLIAMO ITALIANO"
-                title="بلند بگو، یاد بگیر"
-                desc="از جمله‌های ساده شروع کن."
-              />
-              <div className="quiz-card">
-                <span className="pill light">تمرین گفتاری</span>
-                <h2>نیاز دارم استراحت کنم.</h2>
-                <p>جمله را به ایتالیایی بگو.</p>
-                <div className="connection-note">
-                  <Mic size={24} />
-                  <p>
-                    ضبط و تصحیح صوتی در این نسخه فعال نیست. ابتدا باید سرویس
-                    تبدیل گفتار و مدل تصحیح به بک‌اند متصل شود.
-                  </p>
-                </div>
-                <button
-                  className="button outline"
-                  onClick={() => speak("Ho bisogno di riposarmi.")}
-                >
-                  شنیدن پاسخ نمونه <Volume2 size={18} />
-                </button>
-              </div>
-            </>
+          {(page === "chat" || page === "speech") && (
+            <ChatPanel key={page} channel={page === "speech" ? "conversation" : "tutor"} level={settings.level} />
           )}
           {page === "settings" && (
             <>
@@ -1203,18 +742,23 @@ function App() {
               />
               <div className="settings-grid">
                 <section className="settings-card">
-                  <h3>پروفایل موقت</h3>
+                  <h3>حساب من</h3>
                   <label>
                     نام نمایشی
                     <input
-                      placeholder="نام شما؛ بعداً از حساب کاربری"
+                      placeholder="نام نمایشی"
+                      maxLength={100}
+                      disabled={savingAccount}
                       value={profile.displayName}
                       onChange={(e) =>
                         setProfile({ displayName: e.target.value })
                       }
                     />
                   </label>
-                  <p>این فیلد موقت است و ورود یا ثبت‌نام انجام نمی‌دهد.</p>
+                  <p dir="ltr">{accountUser.email}</p>
+                  <button className="button outline" disabled={savingAccount || !profile.displayName.trim()} onClick={() => updatePreference({ display_name: profile.displayName })}>ذخیرهٔ نام</button>
+                  <button className="text-button" disabled={savingAccount || savingReview || preparing} onClick={logout}>خروج از حساب</button>
+                  <PasswordForm />
                 </section>
                 <section className="settings-card">
                   <h3>
@@ -1224,8 +768,9 @@ function App() {
                     سطح تولید محتوای جدید
                     <select
                       value={settings.level}
+                      disabled={savingAccount}
                       onChange={(e) =>
-                        setSettings((s) => ({ ...s, level: e.target.value }))
+                        updatePreference({ settings: { level: e.target.value } })
                       }
                     >
                       {["A1", "A2", "B1", "B2", "C1", "C2"].map((x) => (
@@ -1234,14 +779,12 @@ function App() {
                     </select>
                   </label>
                   <label>
-                    تعداد سؤال روزانه
+                    تعداد سؤال هر جلسه
                     <select
                       value={settings.daily}
+                      disabled={savingAccount}
                       onChange={(e) =>
-                        setSettings((s) => ({
-                          ...s,
-                          daily: Number(e.target.value),
-                        }))
+                        updatePreference({ settings: { daily: Number(e.target.value) } })
                       }
                     >
                       {[5, 10, 15, 20].map((x) => (
@@ -1249,49 +792,18 @@ function App() {
                       ))}
                     </select>
                   </label>
+                  <label>منطقهٔ زمانی
+                    <select value={settings.timezone ?? "Europe/Rome"} disabled={savingAccount} onChange={e => updatePreference({ settings: { timezone: e.target.value } })}>
+                      <option value="Europe/Rome">ایتالیا</option>
+                      <option value="Asia/Tehran">ایران</option>
+                      <option value="UTC">UTC</option>
+                    </select>
+                  </label>
                   <p className="muted">
                     سطح انتخابی فقط برای تولید محتوای جدید است؛ ذخیره و مرور
                     محتوا در هر سطحی آزاد است. زبان فعلی: فارسی ← ایتالیایی.
                     زبان‌های دیگر در نسخه‌های بعدی اضافه می‌شوند.
                   </p>
-                </section>
-                <section className="settings-card">
-                  <h3>
-                    <Download size={20} /> اطلاعات من
-                  </h3>
-                  <p>
-                    با خروجی JSON از دفترچه و پیشرفتت پشتیبان بگیر یا آن را روی
-                    دستگاه دیگری وارد کن.
-                  </p>
-                  <button className="button outline" onClick={exportData}>
-                    <Download size={17} /> دریافت پشتیبان
-                  </button>
-                  <button
-                      className="button outline"
-                      onClick={transferNotebook}
-                      disabled={transferring || preparing || serverBusy || savingReview}
-                  >
-                    <Upload size={17} />
-                    {transferring
-                      ? "در حال انتقال…"
-                      : serverEnabled ? "بازخوانی دفترچه از سرور" : "اتصال دفترچه به سرور"}
-                  </button>
-
-                  <p className="muted">
-                    پس از اتصال، افزودن، حذف و مرور دفترچه روی سرور ثبت می‌شوند.
-                    مرورهای موجود سرور هنگام انتقال اولیه حفظ می‌شوند.
-                    گرامر، تاریخچه و تنظیمات محلی‌اند. بازیابی فایل پشتیبان در حالت سرور هنوز فعال نیست.
-                  </p>
-                  <label className="button outline import-button">
-                    <Upload size={17} /> ورود پشتیبان
-                    <input
-                      type="file"
-                      accept="application/json"
-                      onChange={importData}
-                      disabled={serverEnabled || serverBusy}
-                      hidden
-                    />
-                  </label>
                 </section>
                 <section className="settings-card">
                   <h3>
@@ -1309,7 +821,7 @@ function App() {
                   </h3>
                   <p>Parola Lab · v0.1.0</p>
                   <p>
-                    تحلیل و تولید محتوا فعال‌اند. دفترچه پس از اتصال روی سرور ذخیره می‌شود؛ ورود چندکاربره هنوز فعال نیست.
+                    دفترچه، گرامر و پیشرفت مرور خودکار ذخیره می‌شوند. حساب و تاریخچهٔ هر زبان‌آموز جداست.
                   </p>
                   <span className="badge">اولین برش قابل‌اجرا</span>
                 </section>
@@ -1318,11 +830,12 @@ function App() {
           )}
         </div>
       </main>
-      {!onboarded && (
+      {serverReady && !onboarded && (
         <LevelSetup
+          busy={savingAccount}
           level={settings.level}
-          change={(level) => setSettings((s) => ({ ...s, level }))}
-          finish={() => setOnboarded(true)}
+          change={(level) => updatePreference({ settings: { level } })}
+          finish={() => updatePreference({ onboarded: true })}
         />
       )}
       {(preparing || serverBusy || savingReview) && (
@@ -1335,7 +848,7 @@ function App() {
           <section className="modal">
             <h2 id="preparing-title">{savingReview ? "در حال ثبت پاسخ" : serverBusy ? "در حال ارتباط با دفترچه" : "داریم تمرینت رو آماده می‌کنیم"}</h2>
             <p role="status">
-             {serverBusy || savingReview ? "منتظر تأیید ثبت هستیم…" : "مرور دفترچه و آماده‌کردن مطالب تازه…"}
+             {serverBusy || savingReview ? "منتظر تأیید ثبت هستیم…" : preparingText}
             </p>
           </section>
         </div>
@@ -1353,6 +866,30 @@ function App() {
       )}
     </div>
   );
+}
+function PasswordForm() {
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  async function submit(event) {
+    event.preventDefault();
+    if (busy) return;
+    setBusy(true); setMessage("");
+    try {
+      await changePassword({ current_password: current, new_password: next });
+      setCurrent(""); setNext(""); setMessage("رمز تغییر کرد؛ نشست‌های دستگاه‌های دیگر بسته شدند.");
+    } catch (error) { setMessage(error.message); }
+    finally { setBusy(false); }
+  }
+  return <details className="password-settings"><summary>تغییر رمز عبور</summary>
+    <form onSubmit={submit}>
+      <label>رمز فعلی<input type="password" autoComplete="current-password" required maxLength={128} value={current} onChange={e => setCurrent(e.target.value)} /></label>
+      <label>رمز جدید<input type="password" autoComplete="new-password" required minLength={12} maxLength={128} value={next} onChange={e => setNext(e.target.value)} /></label>
+      <button className="button outline" disabled={busy}>ذخیرهٔ رمز جدید</button>
+      {message && <p role="status">{message}</p>}
+    </form>
+  </details>;
 }
 function Stat({ Icon, value, text, tint }) {
   return (
@@ -1630,7 +1167,7 @@ function AddModal({ close, save }) {
     </div>
   );
 }
-function LevelSetup({ level, change, finish }) {
+function LevelSetup({ level, change, finish, busy }) {
   return (
     <div className="modal-backdrop">
       <section
@@ -1646,21 +1183,23 @@ function LevelSetup({ level, change, finish }) {
         </p>
         <label>
           سطح یادگیری
-          <select value={level} onChange={(e) => change(e.target.value)}>
+          <select value={level} disabled={busy} onChange={(e) => change(e.target.value)}>
             {["A1", "A2", "B1", "B2", "C1", "C2"].map((x) => (
               <option key={x}>{x}</option>
             ))}
           </select>
         </label>
         <p className="muted">هر وقت خواستی از تنظیمات تغییرش بده.</p>
-        <button className="button primary full" onClick={finish}>
+        <button className="button primary full" disabled={busy} onClick={finish}>
           شروع یادگیری
         </button>
       </section>
     </div>
   );
 }
-createRoot(document.getElementById("root")).render(<App />);
+createRoot(document.getElementById("root")).render(
+  <AuthGate>{(user, onSignedOut) => <App key={user.id} accountUser={user} onSignedOut={onSignedOut} />}</AuthGate>
+);
 if ("serviceWorker" in navigator)
   window.addEventListener("load", () =>
     navigator.serviceWorker.register("/sw.js").catch(() => {}),

@@ -1,3 +1,4 @@
+import { apiFetch } from "./api";
 function isoDate(value, label) {
   const date = new Date(value);
 
@@ -94,7 +95,7 @@ export async function importNotebook(items, progress) {
     );
 
     try {
-      const response = await fetch("/api/notebook/import", {
+      const response = await apiFetch("/api/notebook/import", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
