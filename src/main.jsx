@@ -1,4 +1,4 @@
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useEffect } from "react";
 import { createRoot } from "react-dom/client";
 import {
   BookOpen,
@@ -36,6 +36,10 @@ import {
   generateGrammar,
 } from "./services/languageServices";
 import { importNotebook } from "./services/notebookServices";
+import {
+  fetchNotebook, reconcileNotebook, persistNotebookItems,
+  deleteNotebookItem, submitNotebookReview,
+} from "./services/notebookRepository";
 function read(key, fallback) {
   try {
     return JSON.parse(localStorage.getItem(key)) ?? fallback;
@@ -64,6 +68,13 @@ const labels = {
 };
 function App() {
   const [page, setPage] = useState("home");
+  const [serverEnabled, setServerEnabled] = useStored("parola.serverEnabled.v1", false);
+  const [serverReady, setServerReady] = useState(false);
+  const [serverBusy, setServerBusy] = useState(false);
+  const serverLock = useRef(false);
+  const reviewLock = useRef(false);
+  const [savingReview, setSavingReview] = useState(false);
+  const initialLoad = useRef(false);
   const [items, setItems] = useStored("parola.items.v1", seed);
   const [progress, setProgress] = useStored("parola.progress.v1", {});
   const [history, setHistory] = useStored("parola.history.v1", []);
@@ -117,6 +128,65 @@ function App() {
   function toast(s) {
     setNotice(s);
     setTimeout(() => setNotice(""), 4000);
+  }
+  function applySnapshot(rows, currentItems = items, currentProgress = progress) {
+    const decoded = reconcileNotebook(rows, currentItems, currentProgress, grammarBank.map(q => q.id));
+    setItems(decoded.items);
+    setProgress(decoded.progress);
+    return decoded;
+  }
+  useEffect(() => {
+    if (!serverEnabled || initialLoad.current) return;
+    initialLoad.current = true;
+    let cancelled = false;
+    setServerBusy(true);
+    serverLock.current = true;
+    fetchNotebook().then(rows => {
+      if (cancelled) return;
+      applySnapshot(rows);
+      setServerReady(true);
+    }).catch(error => {
+      if (!cancelled) { setServerReady(false); toast(error.message); }
+    }).finally(() => {
+      if (!cancelled) { setServerBusy(false); serverLock.current = false; }
+    });
+    return () => { cancelled = true; };
+  }, []);
+  async function saveNotebookItem(item) {
+    if (!serverEnabled) {
+      setItems(current => [...current, { ...item, id: crypto.randomUUID() }]);
+    } else {
+      if (!serverReady || serverLock.current) throw new Error("ابتدا دفترچه را از سرور بازخوانی کن.");
+      const candidate = { ...item, id: crypto.randomUUID(), origin: item.origin ?? "user", createdAt: new Date().toISOString() };
+      // The stable client ID is saved on the server; refresh recovers a lost response.
+      serverLock.current = true;
+      setServerBusy(true);
+      try {
+        const saved = await persistNotebookItems([candidate]);
+        setItems(current => [...current, ...saved.filter(x => !current.some(y => y.id === x.id))]);
+      } catch (error) {
+        setServerReady(false);
+        throw error;
+      } finally { serverLock.current = false; setServerBusy(false); }
+    }
+    setModal(false);
+    toast("به دفترچه اضافه شد.");
+  }
+  async function removeNotebookItem(item) {
+    if (!confirm("این مورد از دفترچه حذف شود؟")) return;
+    if (!serverEnabled) {
+      setItems(current => current.filter(x => x.id !== item.id));
+      return;
+    }
+    if (!serverReady || serverLock.current) return toast("ابتدا دفترچه را از سرور بازخوانی کن.");
+    serverLock.current = true;
+    setServerBusy(true);
+    try {
+      await deleteNotebookItem(item.serverId);
+      setItems(current => current.filter(x => x.id !== item.id));
+      setProgress(current => { const next = { ...current }; delete next[item.id]; return next; });
+    } catch (error) { setServerReady(false); toast(error.message); }
+    finally { serverLock.current = false; setServerBusy(false); }
   }
   function speak(text) {
     if (!("speechSynthesis" in window))
@@ -268,7 +338,8 @@ function App() {
   }));
 }
   async function start(mode = "mix") {
-    if (preparingLock.current) return;
+    if (preparingLock.current || serverLock.current || reviewLock.current) return;
+    if (serverEnabled && !serverReady && mode !== "grammar") return toast("ابتدا دفترچه را از سرور بازخوانی کن.");
 
     preparingLock.current = true;
     setPreparing(true);
@@ -377,6 +448,11 @@ function App() {
               }));
 
             if (additions.length) {
+              let savedAdditions = additions;
+              if (serverEnabled) {
+                try { savedAdditions = await persistNotebookItems(additions); }
+                catch (error) { setServerReady(false); throw error; }
+              }
               setItems((current) => {
                 const existing = new Set(
                   current.map((item) => normalize(item.text)),
@@ -384,7 +460,7 @@ function App() {
 
                 return [
                   ...current,
-                  ...additions.filter(
+                  ...savedAdditions.filter(
                     (item) => !existing.has(normalize(item.text)),
                   ),
                 ];
@@ -392,17 +468,16 @@ function App() {
 
               // از نتیجهٔ همین درخواست استفاده می‌کنیم؛
               // منتظر به‌روزرسانی state نمی‌مانیم.
-              ready = [...ready, ...additions];
+              ready = [...ready, ...savedAdditions];
             }
 
             setGenerationDays((current) => ({
               ...current,
               [level]: dayKey,
             }));
-          } catch {
-            toast(
-              "محتوای تازه آماده نشد؛ تمرین با مطالب موجود ادامه دارد.",
-            );
+          } catch (error) {
+            if (serverEnabled) { toast(error.message || "آماده‌سازی انجام نشد؛ دفترچه را بازخوانی کن."); return; }
+            toast("محتوای تازه آماده نشد؛ تمرین با مطالب موجود ادامه دارد.");
           }
         }
       }
@@ -468,43 +543,62 @@ function App() {
       setPreparing(false);
     }
   }
-  function submit(value) {
-    if (answer !== null) return;
-    const q = session.questions[session.index],
-      correct = value === q.answer;
-    setAnswer(value);
-    setSession((s) => ({ ...s, score: s.score + (correct ? 1 : 0) }));
-    setProgress((p) => ({ ...p, [q.id]: schedule(p[q.id], correct) }));
-    setHistory((h) => [
-      ...h,
-      { id: q.id, correct, date: today, at: Date.now() },
-    ]);
+  async function submit(value) {
+    if (answer !== null || reviewLock.current || !session) return;
+    const q = session.questions[session.index];
+    const correct = value === q.answer;
+    reviewLock.current = true;
+    setSavingReview(true);
+    try {
+      let updated;
+      if (!q.grammar && serverEnabled) {
+        if (!serverReady) throw new Error("ابتدا دفترچه را از سرور بازخوانی کن.");
+        updated = await submitNotebookReview(q.item.serverId, correct);
+      } else updated = schedule(progress[q.id], correct);
+      setProgress(current => ({ ...current, [q.id]: updated }));
+      setHistory(current => [...current, { id: q.id, correct, date: today, at: Date.now() }]);
+      setSession(current => current ? { ...current, score: current.score + Number(correct) } : current);
+      setAnswer(value);
+    } catch (error) {
+      // Do not repeat an attempt whose response may have been lost.
+      setServerReady(false);
+      setSession(null);
+      setAnswer(null);
+      toast(`${error.message} تمرین متوقف شد؛ از تنظیمات دفترچه را بازخوانی کن.`);
+    } finally { reviewLock.current = false; setSavingReview(false); }
   }
   function next() {
+    if (reviewLock.current) return;
     setSession((s) => ({ ...s, index: s.index + 1 }));
     setAnswer(null);
   }
   async function transferNotebook() {
-  if (transferLock.current) return;
-
-  transferLock.current = true;
-  setTransferring(true);
-
-  try {
-    const result = await importNotebook(items, progress);
-
-    toast(
-      `${result.created} مورد جدید، ` +
-      `${result.existing} مورد از قبل موجود و ` +
-      `${result.reviews_created} سابقهٔ مرور ذخیره شد.`,
-    );
-  } catch (error) {
-    toast(error.message || "انتقال انجام نشد.");
-  } finally {
-    transferLock.current = false;
-    setTransferring(false);
+    if (transferLock.current || serverLock.current || reviewLock.current || preparingLock.current) return;
+    transferLock.current = true;
+    serverLock.current = true;
+    setTransferring(true);
+    setServerBusy(true);
+    try {
+      if (!serverEnabled) {
+        // Retain the original cache as a separate recovery checkpoint.
+        localStorage.setItem("parola.beforeServer.v1", JSON.stringify({ items, progress, history, grammarBank, settings, profile, generationDays }));
+        if (items.length) await importNotebook(items, progress);
+      }
+      const rows = await fetchNotebook();
+      applySnapshot(rows);
+      setSession(null);
+      setAnswer(null);
+      setServerEnabled(true);
+      setServerReady(true);
+      toast("دفترچه به سرور متصل شد؛ گرامر و تاریخچه همچنان محلی‌اند.");
+    } catch (error) { setServerReady(false); toast(error.message || "اتصال انجام نشد."); }
+    finally {
+      transferLock.current = false;
+      serverLock.current = false;
+      setTransferring(false);
+      setServerBusy(false);
+    }
   }
-}
   function exportData() {
     const url = URL.createObjectURL(
       new Blob(
@@ -534,6 +628,11 @@ function App() {
     URL.revokeObjectURL(url);
   }
   function importData(e) {
+    if (serverEnabled) {
+      e.target.value = "";
+      toast("بازیابی فایل در حالت اتصال به سرور هنوز فعال نیست؛ پشتیبان را نگه دار.");
+      return;
+    }
     const f = e.target.files[0];
     if (!f) return;
     const reader = new FileReader();
@@ -607,6 +706,7 @@ function App() {
               className={page === id ? "nav-item active" : "nav-item"}
               key={id}
               onClick={() => {
+                if (reviewLock.current) return;
                 setPage(id);
                 if (id === "practice") setSession(null);
               }}
@@ -644,7 +744,7 @@ function App() {
           </div>
           <div className="top-actions">
             <span className="local-status">
-              <span /> ذخیره روی این دستگاه
+              <span /> {serverEnabled ? (serverReady ? "دفترچه متصل به سرور" : "دفترچه نیاز به بازخوانی دارد") : "ذخیره روی این دستگاه"}
             </span>
             <span className="date">
               {new Date().toLocaleDateString("fa-IR", {
@@ -655,6 +755,12 @@ function App() {
           </div>
         </header>
         <div className="content">
+          {serverEnabled && !serverReady && !serverBusy && (
+            <div role="alert" className="connection-note">
+              <p>اتصال دفترچه تأیید نشده؛ نسخهٔ ذخیره‌شده فقط برای مشاهده است.</p>
+              <button className="button outline" onClick={transferNotebook}>بازخوانی از سرور</button>
+            </div>
+          )}
           {page === "home" && (
             <>
               <div className="page-heading">
@@ -898,10 +1004,7 @@ function App() {
                       key={x.id}
                       item={x}
                       speak={speak}
-                      remove={() => {
-                        if (confirm("این مورد از دفترچه حذف شود؟"))
-                          setItems((a) => a.filter((i) => i.id !== x.id));
-                      }}
+                      remove={() => removeNotebookItem(x)}
                     />
                   ))}
               </div>
@@ -909,8 +1012,7 @@ function App() {
                 <div className="empty">اولین کلمه‌ات رو اضافه کن.</div>
               )}
               <div className="storage-note">
-                اطلاعات این نسخه در مرورگر همین دستگاه ذخیره می‌شود. از تنظیمات
-                پشتیبان بگیر.
+                {serverEnabled ? "دفترچه و مرور لغت روی سرور ذخیره می‌شوند؛ گرامر، تاریخچه و تنظیمات محلی‌اند." : "اطلاعات روی همین دستگاه است؛ از تنظیمات می‌توانی دفترچه را به سرور وصل کنی."}
               </div>
             </>
           )}
@@ -988,6 +1090,7 @@ function App() {
                 <Quiz
                   session={session}
                   answer={answer}
+                  saving={savingReview}
                   submit={submit}
                   next={next}
                   speak={speak}
@@ -1166,18 +1269,18 @@ function App() {
                   <button
                       className="button outline"
                       onClick={transferNotebook}
-                      disabled={transferring || preparing || Boolean(session)}
+                      disabled={transferring || preparing || serverBusy || savingReview}
                   >
                     <Upload size={17} />
                     {transferring
                       ? "در حال انتقال…"
-                      : "کپی دفترچه به سرور"}
+                      : serverEnabled ? "بازخوانی دفترچه از سرور" : "اتصال دفترچه به سرور"}
                   </button>
 
                   <p className="muted">
-                    کپی شامل دفترچه و پیشرفت مرور آن است.
-                    انتقال دوباره، داده‌های موجود سرور را بازنویسی نمی‌کند.
-                    گرامر و تاریخچه فعلاً محلی باقی می‌مانند.
+                    پس از اتصال، افزودن، حذف و مرور دفترچه روی سرور ثبت می‌شوند.
+                    مرورهای موجود سرور هنگام انتقال اولیه حفظ می‌شوند.
+                    گرامر، تاریخچه و تنظیمات محلی‌اند. بازیابی فایل پشتیبان در حالت سرور هنوز فعال نیست.
                   </p>
                   <label className="button outline import-button">
                     <Upload size={17} /> ورود پشتیبان
@@ -1185,6 +1288,7 @@ function App() {
                       type="file"
                       accept="application/json"
                       onChange={importData}
+                      disabled={serverEnabled || serverBusy}
                       hidden
                     />
                   </label>
@@ -1205,8 +1309,7 @@ function App() {
                   </h3>
                   <p>Parola Lab · v0.1.0</p>
                   <p>
-                    دفترچه، تمرین، مرور و خروجی پشتیبان فعال‌اند. ذخیره‌سازی این
-                    پیش‌نمایش محلی است؛ اتصال سرور و AI هنوز فعال نیست.
+                    تحلیل و تولید محتوا فعال‌اند. دفترچه پس از اتصال روی سرور ذخیره می‌شود؛ ورود چندکاربره هنوز فعال نیست.
                   </p>
                   <span className="badge">اولین برش قابل‌اجرا</span>
                 </section>
@@ -1222,7 +1325,7 @@ function App() {
           finish={() => setOnboarded(true)}
         />
       )}
-      {preparing && (
+      {(preparing || serverBusy || savingReview) && (
         <div
           className="modal-backdrop"
           role="dialog"
@@ -1230,9 +1333,9 @@ function App() {
           aria-labelledby="preparing-title"
         >
           <section className="modal">
-            <h2 id="preparing-title">داریم تمرینت رو آماده می‌کنیم</h2>
+            <h2 id="preparing-title">{savingReview ? "در حال ثبت پاسخ" : serverBusy ? "در حال ارتباط با دفترچه" : "داریم تمرینت رو آماده می‌کنیم"}</h2>
             <p role="status">
-             مرور دفترچه و آماده‌کردن مطالب تازه…
+             {serverBusy || savingReview ? "منتظر تأیید ثبت هستیم…" : "مرور دفترچه و آماده‌کردن مطالب تازه…"}
             </p>
           </section>
         </div>
@@ -1245,11 +1348,7 @@ function App() {
       {modal && (
         <AddModal
           close={() => setModal(false)}
-          save={(item) => {
-            setItems((a) => [...a, { ...item, id: crypto.randomUUID() }]);
-            setModal(false);
-            toast("به دفترچه اضافه شد.");
-          }}
+          save={saveNotebookItem}
         />
       )}
     </div>
@@ -1337,7 +1436,7 @@ function ItemCard({ item, speak, remove }) {
     </article>
   );
 }
-function Quiz({ session, answer, submit, next, speak }) {
+function Quiz({ session, answer, saving, submit, next, speak }) {
   const q = session.questions[session.index];
   return (
     <div className="quiz-card">
@@ -1373,11 +1472,12 @@ function Quiz({ session, answer, submit, next, speak }) {
           <Volume2 size={22} />
         </button>
       )}
+      {saving && <p role="status">در حال ثبت پاسخ…</p>}
       <div className="options">
         {q.options.map((v, i) => (
           <button
             key={v}
-            disabled={answer !== null}
+            disabled={answer !== null || saving}
             onClick={() => submit(v)}
             className={`option ${answer !== null && v === q.answer ? "correct" : ""} ${answer === v && v !== q.answer ? "incorrect" : ""}`}
           >
