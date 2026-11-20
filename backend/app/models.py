@@ -8,6 +8,7 @@ DEV_USER_ID = "00000000-0000-0000-0000-000000000001"
 
 class User(Base):
     __tablename__ = "users"
+    access_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
     password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     id: Mapped[str] = mapped_column(

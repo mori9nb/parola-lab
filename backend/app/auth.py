@@ -60,7 +60,7 @@ def get_current_user_id(request: Request, session: Session = Depends(db)) -> str
     if record is None or utc(record.expires_at) <= now_utc():
         raise HTTPException(401, "Session expired; sign in again")
     user = session.get(User, record.user_id)
-    if user is None or not user.password_hash:
+    if user is None or not user.password_hash or not user.access_enabled:
         raise HTTPException(401, "Sign in required")
     return user.id
 
@@ -149,7 +149,7 @@ def login(data: Credentials, request: Request, response: Response, session: Sess
     rate_limit(session, request, data.email, "login")
     user = session.scalar(select(User).where(User.email == data.email))
     valid = passwords.verify(data.password, user.password_hash if user and user.password_hash else DUMMY_HASH)
-    if not valid or user is None or not user.password_hash:
+    if not valid or user is None or not user.password_hash or not user.access_enabled:
         raise HTTPException(401, "Email or password is incorrect")
     issue_session(session, user.id, response, request.cookies.get(COOKIE))
     return public_user(user)

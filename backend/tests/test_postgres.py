@@ -47,7 +47,7 @@ def test_real_postgres_migration_preserves_existing_notebook(pg_schema):
         c.execute(text("INSERT INTO items (id,user_id,text,meaning,kind,level,source_language,target_language,example,translation,tag,note,origin,source_text,analysis_status) VALUES ('preserved',:owner,'Ciao','hello','word','A1','fa','it','','','','','user','','completed')"),{'owner':DEV_USER_ID})
     migrate('head')
     with engine.connect() as c:
-        assert c.execute(text('SELECT version_num FROM alembic_version')).scalar_one()=='006'
+        assert c.execute(text('SELECT version_num FROM alembic_version')).scalar_one()=='007'
         assert c.execute(text("SELECT count(*) FROM items WHERE id='preserved'")).scalar_one()==1
 
 
