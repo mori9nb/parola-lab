@@ -492,3 +492,9 @@ def review_grammar_entry(
     user_id: str = Depends(get_current_user_id),
 ):
     return record_review(session, user_id, "grammar", entry_id, attempt.correct, attempt.attempt_id)
+
+
+# All API routes must be registered before the frontend catch-all.
+if settings.serve_frontend:
+    from app.frontend import mount_frontend
+    mount_frontend(app, settings.frontend_directory)

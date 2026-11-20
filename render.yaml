@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: parola
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile.render
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        sync: false
+      - key: SESSION_COOKIE_SECURE
+        value: "true"
+      - key: AUTH_REGISTRATION_ENABLED
+        value: "false"

@@ -9,3 +9,9 @@ dist
 **/.env.*
 **/.venv
 **/.pytest_cache
+
+*:Zone.Identifier
+**/*:Zone.Identifier
+**/*.dump
+**/*.bak
+**/*.sql

@@ -40,7 +40,7 @@ async def enforce_request_origin(request: Request, call_next):
             return JSONResponse({"detail": "Missing request protection header"}, status_code=403)
         origin = request.headers.get("origin")
         if origin:
-            expected = settings.public_origin.rstrip("/") or f"{request.url.scheme}://{request.headers.get('host', '')}"
+            expected = (settings.public_origin or settings.render_external_url).rstrip("/") or f"{request.url.scheme}://{request.headers.get('host', '')}"
             if not origin.lower().startswith(("http://", "https://")) or origin.rstrip("/").lower() != expected.lower():
                 return JSONResponse({"detail": "Cross-origin request rejected"}, status_code=403)
         if request.headers.get("sec-fetch-site") == "cross-site":
